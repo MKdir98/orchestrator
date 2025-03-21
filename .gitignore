@@ -1,0 +1,5 @@
+/.env
+/orchestrator.db
+/orchestrator/services/data/
+/.idea
+/poetry.lock
