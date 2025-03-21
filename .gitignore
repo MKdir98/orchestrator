@@ -3,3 +3,5 @@
 /orchestrator/services/data/
 /.idea
 /poetry.lock
+__pycache__/
+*.pyc
