@@ -126,12 +126,12 @@ class CommandService:
 
         async def async_typing():
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
-                await client.type(text)
+                client.keyboard.write(text)
 
         asyncio.run(async_typing())
 
     @staticmethod
-    def click(x, y , current_user_id: int):
+    def click(x, y, current_user_id: int):
         db = SessionLocal()
 
         user = db.query(User).filter(User.id == current_user_id).first()
@@ -140,13 +140,13 @@ class CommandService:
 
         async def async_click():
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
-                await client.mouse.move(x, y)
-                await client.mouse.click()
+                client.mouse.move(int(x), int(y))
+                client.mouse.click()
 
         asyncio.run(async_click())
 
     @staticmethod
-    def double_click(x, y , current_user_id: int):
+    def double_click(x, y, current_user_id: int):
         db = SessionLocal()
 
         user = db.query(User).filter(User.id == current_user_id).first()
@@ -155,28 +155,14 @@ class CommandService:
 
         async def async_click():
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
-                await client.mouse.move(x, y)
-                await client.mouse.double_click()
-
-        asyncio.run(async_click())
-        
-    @staticmethod
-    def right_click(x, y , current_user_id: int):
-        db = SessionLocal()
-
-        user = db.query(User).filter(User.id == current_user_id).first()
-        if not user:
-            raise ValueError(f"User with ID {current_user_id} not found.")
-
-        async def async_click():
-            async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
-                await client.mouse.move(x, y)
-                await client.mouse.right_click()
+                client.mouse.move(int(x), int(y))
+                client.mouse.click()
+                client.mouse.click()
 
         asyncio.run(async_click())
 
     @staticmethod
-    def send_key(name , current_user_id: int):
+    def right_click(x, y, current_user_id: int):
         db = SessionLocal()
 
         user = db.query(User).filter(User.id == current_user_id).first()
@@ -185,7 +171,22 @@ class CommandService:
 
         async def async_click():
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
-                await client.keyboard.press(name)
+                client.mouse.move(int(x), int(y))
+                client.mouse.right_click()
+
+        asyncio.run(async_click())
+
+    @staticmethod
+    def send_key(name, current_user_id: int):
+        db = SessionLocal()
+
+        user = db.query(User).filter(User.id == current_user_id).first()
+        if not user:
+            raise ValueError(f"User with ID {current_user_id} not found.")
+
+        async def async_click():
+            async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
+                client.keyboard.press(name)
 
         asyncio.run(async_click())
 
@@ -209,7 +210,27 @@ class CommandService:
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 pixels = await client.screenshot()
                 image = Image.fromarray(pixels)
-                image.save('screenshot.png')
+                image.save('../services/data/' + str(user.id) + '/screenshot.png')
                 return pixels
 
         return asyncio.run(async_screenshot())
+
+    @staticmethod
+    def run_command_via_container(command, current_user_id: int):
+        """
+        Simulate running a command via container service.
+        """
+        command_to_execute = f"python3 /root/Desktop/orchestrator/app.py run '{command}'"
+        container_service = ContainerService()
+        output = container_service.exec_command_in_container(current_user_id, command_to_execute)
+        print(output)
+
+    @staticmethod
+    def run_background_command_via_container(command, current_user_id: int):
+        """
+        Simulate running a background command via container service.
+        """
+        command_to_execute = f"python3 /root/Desktop/orchestrator/app.py runbg '{command}'"
+        container_service = ContainerService()
+        output = container_service.exec_command_in_container(current_user_id, command_to_execute)
+        print(output)

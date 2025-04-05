@@ -22,6 +22,11 @@ openai = "^1.66.3"
 anthropic = "^0.49.0"
 dotenv = "^0.9.9"
 asyncvnc = "^1.3.0"
+numpy = "^1.24.0"
+scikit-learn = "^1.3.0"
+alembic = "^1.15.2"
+pymysql = "^1.1.1"
+pysqlite3 = "^0.5.4"
 
 [tool.poetry.scripts]
 start = "orchestrator.test:main"

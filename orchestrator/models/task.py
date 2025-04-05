@@ -10,9 +10,10 @@ import json
 class TaskStatus(PyEnum):
     NEW = "new"
     IN_PROGRESS = "in_progress"
-    BLOCK_BY_OTHER_TASK = "block_by_other_task"
-    WAIT_FOR_APPROVE = "wait_for_approve"
+    # BLOCK_BY_OTHER_TASK = "block_by_other_task"
+    # WAIT_FOR_APPROVE = "wait_for_approve"
     FINISH = "finish"
+    PAUSED = "paused"
 
 
 # مدل Task
@@ -24,6 +25,9 @@ class Task(Base):
     status = Column(Enum(TaskStatus), default=TaskStatus.NEW)
     user_id = Column(Integer, ForeignKey("users.id"))
     parent_task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True)
+    priority = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationship with user
     user = relationship("User", back_populates="tasks")
@@ -54,7 +58,7 @@ class TaskMessage(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     content = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)  # زمان ایجاد پیام
-    task_id = Column(Integer, ForeignKey("tasks.id"))  # کلید خارجی به تسک مربوطه
+    created_at = Column(DateTime, default=datetime.utcnow)
+    task_id = Column(Integer, ForeignKey("tasks.id"))
 
     task = relationship("Task", back_populates="task_messages")

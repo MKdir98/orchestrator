@@ -143,8 +143,6 @@ class OpenAIBaseProvider(LLMProvider):
         tools = self.create_function_schema(functions) if functions else None
         completion = self.completion(messages, tools=tools)
         message = completion.choices[0].message
-        print(completion)
-        print(message)
 
         # Return response text and tool calls separately
         if functions:
@@ -159,16 +157,17 @@ class OpenAIBaseProvider(LLMProvider):
 
             # Sometimes, function calls are returned unparsed by the inference provider. This code parses them manually.
             if message.content and not tool_calls:
-                tool_call_matches = re.search(r"\{.*\}", message.content)
-                if tool_call_matches:
-                    tool_call = parse_json(tool_call_matches.group(0))
-                    # Some models use "arguments" as the key instead of "parameters"
-                    parameters = tool_call.get("parameters", tool_call.get("arguments"))
-                    if tool_call.get("name") and parameters:
-                        combined_tool_calls.append(
-                            self.create_tool_call(tool_call.get("name"), parameters)
-                        )
-                        return None, combined_tool_calls
+                return None, None
+                # tool_call_matches = re.search(r"\{.*\}", message.content)
+                # if tool_call_matches:
+                #     tool_call = parse_json(tool_call_matches.group(0))
+                #     # Some models use "arguments" as the key instead of "parameters"
+                #     parameters = tool_call.get("parameters", tool_call.get("arguments"))
+                #     if tool_call.get("name") and parameters:
+                #         combined_tool_calls.append(
+                #             self.create_tool_call(tool_call.get("name"), parameters)
+                #         )
+                #         return None, combined_tool_calls
 
             return message.content, combined_tool_calls
 
@@ -346,7 +345,6 @@ class G4FProvider(LLMProvider):
 
         # ایجاد completion با استفاده از g4f
         try:
-            print(messages)
             completion = self.create_client().create(
                 model=self.model,  # یا هر مدل دیگری که پشتیبانی می‌شود
                 messages=messages,
