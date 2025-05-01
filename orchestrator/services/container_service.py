@@ -9,7 +9,6 @@ class ContainerService:
     def __init__(self):
         self.client = docker.from_env()
 
-    
     def find_container_by_user(self, user):
         try:
             container = self.client.containers.get(f"orchestrator_container_{user.id}")
@@ -31,6 +30,7 @@ class ContainerService:
                 image="karam_orchestrator:latest",
                 command="sleep infinity",
                 detach=True,
+                network="orchestrator_default",
                 name=f"orchestrator_container_{user.id}",
                 ports={
                     "80/tcp": novnc_port,
@@ -42,9 +42,12 @@ class ContainerService:
                         "mode": "rw",
                     }
                 },
+                environment={
+                    "RESOLUTION": "1920x1080"
+                }
             )
             user.vnc_port = vnc_port
-            
+
             user.novnc_port = novnc_port
             session.add(user)
             session.commit()
@@ -71,8 +74,8 @@ class ContainerService:
             str: The output of the command, or an error message if the container is not found.
         """
         container = self.client.containers.get(f"orchestrator_container_{user_id}")
-        
+
         exec_result = container.exec_run(command)
         print(exec_result)
-        
+
         return exec_result.output.decode("utf-8")

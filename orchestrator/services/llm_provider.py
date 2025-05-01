@@ -1,5 +1,10 @@
+from g4f import ProviderType
+from g4f.Provider import Glider, AllenAI, Blackbox, PollinationsAI, OIVSCode, DeepInfraChat, Dynaspark, HuggingFace, \
+    HuggingFaceAPI
+from gradio_client import Client, handle_file
 from openai import OpenAI
 from anthropic import Anthropic
+import traceback
 
 from PIL import Image
 import io
@@ -7,6 +12,9 @@ import json
 import re
 import base64
 import g4f
+import os
+
+from orchestrator.services.qwen_service import HF_TOKEN
 
 
 def Message(content, role="assistant"):
@@ -99,8 +107,6 @@ class LLMProvider:
         if hasattr(completion, "error"):
             raise Exception("Error calling model: {}".format(completion.error))
         return completion
-
-
 
 
 class OpenAIBaseProvider(LLMProvider):
@@ -249,166 +255,84 @@ class MistralBaseProvider(OpenAIBaseProvider):
                 messages.append({"role": "user", "content": prefix})
         return super().call(messages, functions)
 
+
 class G4FProvider(LLMProvider):
 
     def create_client(self):
-        # استفاده از g4f به عنوان کلاینت
-        return g4f.ChatCompletion
+        return g4f.Client(PollinationsAI).chat.completions
 
-    def create_function_def(self, name, details, properties, required):
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": details["description"],
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
-            },
-        }
-
-    def call(self, messages, functions=None):
-        """
-        ارسال درخواست به مدل و پردازش پاسخ.
-
-        Args:
-            messages (list): لیستی از پیام‌ها (هر پیام یک دیکشنری با کلیدهای 'role' و 'content').
-            functions (dict, optional): دیکشنری توابعی که مدل می‌تواند فراخوانی کند.
-
-        Returns:
-            tuple: یک تاپل شامل (content, tool_calls) که:
-                - content (str): متن پاسخ مدل.
-                - tool_calls (list): لیستی از فراخوانی‌های تابع (هر تابع یک دیکشنری با کلیدهای 'name' و 'arguments').
-        """
-        # print(messages)
-        # اگر توابع ارائه شده‌اند، آن‌ها را به مدل بفهمانید
-        if functions:
-            # بررسی اینکه functions یک دیکشنری باشد
-            if not isinstance(functions, dict):
-                raise ValueError("The 'functions' parameter must be a dictionary.")
-
-            # تبدیل دیکشنری functions به لیست
-            functions_list = []
-            for func_name, func_details in functions.items():
-                if not isinstance(func_details, dict):
-                    raise ValueError(f"Function '{func_name}' details must be a dictionary.")
-                if "description" not in func_details or "params" not in func_details:
-                    raise ValueError(f"Function '{func_name}' must have 'description' and 'params' keys.")
-                
-                # تبدیل params به properties و required
-                properties = {}
-                required = []
-                for param_name, param_desc in func_details["params"].items():
-                    properties[param_name] = {
-                        "type": "string",  # فرض می‌کنیم همه پارامترها رشته هستند
-                        "description": param_desc,
+    def call(self, message, image, tools=None):
+        imageData = [[open(image, "rb"), 'picture.png']]
+        if tools is not None:
+            exampleFakeData = '''
+                [{
+                    "name":"click" , // you MUST use 'name'
+                    "parameters": { // DONT answer with 'params'
+                        "x": "111", "y": "222",
+                        "last_action_result": "test last action result",
+                        "image_width": "1234",
+                        "image_height": "4321",
+                        "description": "Fake reason"
                     }
-                    required.append(param_name)
-                
-                # ایجاد تعریف تابع
-                functions_list.append({
-                    "name": func_name,
-                    "description": func_details["description"],
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    },
-                })
+                }]
+                '''
+            tool_calls_prompt = (
+                    'The format of the response is should be EXACT like this: Example of response with fake data: ' +
+                    exampleFakeData + '. These are the list of functions that always you MUST use in your json response: ' + json.dumps(
+                tools) + '')
+            message = message + tool_calls_prompt
 
-            system_prompt = {
-                "role": "system",
-                "content": """
-                You are a helpful assistant. Your response must be a valid JSON array of tool calls. Each tool call should have a 'name' and 'parameters' field.
-                Important rules:
-                1. Your response must **ONLY** contain a valid JSON array. Do not include any additional text, explanations, or formatting outside the JSON array.
-                2. The JSON array must follow this structure:
-                [
-                    {
-                        "name": "tool_name",
-                        "parameters": {
-                            "param1": "value1",
-                            "param2": "value2"
-                        }
-                    }
-                ]
-                3. If no tools are needed, return an empty array: [].
-                4. **Never** add any comments, explanations, or additional text outside the JSON array.
-                """
-            }
-            messages.insert(0, system_prompt)
+        response = self.client.create(
+            message, 'openai-large', images=imageData).choices[0].message.content  ## That was not great
 
-            # اضافه کردن توابع به پیام‌ها
-            messages.append({"role": "user", "content": "Please generate tool calls based on the following functions: " + json.dumps(functions_list)})
-
-        # ایجاد completion با استفاده از g4f
-        try:
-            completion = self.create_client().create(
-                model=self.model,  # یا هر مدل دیگری که پشتیبانی می‌شود
-                messages=messages,
-            )
-        except Exception as e:
-            print(f"Error during completion: {e}")
-            return "", []  # برگرداندن مقادیر پیش‌فرض در صورت خطا
-
-        # پردازش پاسخ
-        response = completion
-        # print(response)
-
-        # اگر توابع ارائه شده‌اند، پاسخ را به‌صورت JSON پارس کنید
-        if functions:
-            try:
-                # حذف ```json و ``` از ابتدا و انتهای response (اگر وجود داشته باشد)
-                response = re.sub(r'^```json\s*|\s*```$', '', response, flags=re.MULTILINE).strip()
-                
-                # تلاش برای پارس کردن JSON کامل
-                tool_calls = json.loads(response)
-                
-                # بررسی اینکه آیا tool_calls یک لیست است
-                if isinstance(tool_calls, list):
-                    # بررسی ساختار هر آیتم در لیست
-                    for tool_call in tool_calls:
-                        if not isinstance(tool_call, dict):
-                            raise ValueError("Each tool call must be a dictionary.")
-                        if "name" not in tool_call or "arguments" not in tool_call:
-                            raise ValueError("Each tool call must have 'name' and 'arguments' keys.")
-                    return response, tool_calls
-                else:
-                    # اگر tool_calls یک دیکشنری است، آن را به لیست تبدیل کنید
-                    if isinstance(tool_calls, dict):
-                        if "name" in tool_calls and "arguments" in tool_calls:
-                            return response, [tool_calls]
-                        else:
-                            raise ValueError("The tool call must have 'name' and 'arguments' keys.")
-                    else:
-                        raise ValueError("The response must be a list or a dictionary.")
-            
-            except json.JSONDecodeError:
-                # اگر JSON کامل نبود، به‌صورت دستی JSON را استخراج کنید
-                try:
-                    tool_call_matches = re.findall(r"\{.*?\}", response)
-                    if tool_call_matches:
-                        tool_calls = []
-                        for match in tool_call_matches:
-                            try:
-                                tool_call = json.loads(match)
-                                if isinstance(tool_call, dict) and "name" in tool_call and "arguments" in tool_call:
-                                    tool_calls.append(tool_call)
-                            except json.JSONDecodeError:
-                                continue  # اگر JSON نامعتبر بود، از آن صرف‌نظر کنید
-                        
-                        if tool_calls:
-                            return response, tool_calls
-                        else:
-                            print("Error: No valid tool calls found in the response.")
-                            return response, []
-                    else:
-                        print("Error: Model did not return valid JSON.")
-                        return response, []
-                except Exception as e:
-                    print(f"Error parsing JSON: {e}")
-                    return response, []
+        print(message, response)
+        if tools is not None:
+            if response[0:3] == '```':
+                return ['', json.loads(response[7:-3])]
+            else:
+                return ['', json.loads(response)]
         else:
-            return response, []  # برگرداندن محتوا و یک لیست خالی از tool_calls
+            return response
+
+
+class HuggingFaceProvider(LLMProvider):
+
+    def call(self, message, image, tools=None):
+        if (tools != None):
+            exampleFakeData = '''
+                    [{
+                        "name":"click" , // you MUST use 'name'
+                        "parameters": { // DONT answer with 'params'
+                            "x": "111", "y": "222",
+                            "last_action_result": "test last action result",
+                            "image_width": "1234",
+                            "image_height": "4321",
+                            "description": "Fake reason"
+                        }
+                    }]
+                    '''
+            tool_calls_prompt = (
+                    'The format of the response is should be EXACT like this: Example of response with fake data: ' +
+                    exampleFakeData + '. These are the list of functions that always you MUST use in your json response: ' + json.dumps(
+                tools) + '')
+            message = message + tool_calls_prompt
+
+            # messages[1]['content'] = messages[1]['content'] + tool_calls_prompt
+
+        response = self.client.predict(
+            message={"text": message, "files": [
+                handle_file(image)]},
+            api_name="/chat"
+        )
+
+        print(messages, response)
+        if tools is not None:
+            if response[0:3] == '```':
+                return ['', json.loads(response[7:-3])]
+            else:
+                return ['', json.loads(response)]
+        else:
+            return response
+
+    def create_client(self):
+        return Client("prithivMLmods/Qwen2.5-VL-7B-Instruct", hf_token=HF_TOKEN)

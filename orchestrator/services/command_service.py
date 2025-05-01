@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 import asyncio, asyncvnc
 from PIL import Image
 
+from orchestrator.services.data_service import DataService
+
 
 class CommandService:
     """
@@ -177,6 +179,20 @@ class CommandService:
         asyncio.run(async_click())
 
     @staticmethod
+    def move_mouse(x, y, current_user_id: int):
+        db = SessionLocal()
+
+        user = db.query(User).filter(User.id == current_user_id).first()
+        if not user:
+            raise ValueError(f"User with ID {current_user_id} not found.")
+
+        async def async_click():
+            async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
+                client.mouse.move(int(x), int(y))
+
+        asyncio.run(async_click())
+
+    @staticmethod
     def send_key(name, current_user_id: int):
         db = SessionLocal()
 
@@ -210,7 +226,7 @@ class CommandService:
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 pixels = await client.screenshot()
                 image = Image.fromarray(pixels)
-                image.save('../services/data/' + str(user.id) + '/screenshot.png')
+                image.save(DataService().get_user_path_screenshot(user.id))
                 return pixels
 
         return asyncio.run(async_screenshot())

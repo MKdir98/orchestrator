@@ -3,6 +3,7 @@ import os
 
 from flask import Flask, render_template, jsonify, request
 
+from orchestrator.services.chat_service import ChatService
 from orchestrator.services.processor_service import ProcessorService
 
 # API to process tasks for a user
@@ -83,7 +84,8 @@ def create_user_api():
     db = SessionLocal()
     user = create_user(db, data["name"], data["parent_user_id"], data["group_id"], data["vnc_port"])
     db.close()
-    return jsonify({"id": user.id, "name": user.name, "parent_user_id": user.parent_user_id, "vnc_port": user.novnc_port})
+    return jsonify(
+        {"id": user.id, "name": user.name, "parent_user_id": user.parent_user_id, "vnc_port": user.novnc_port})
 
 
 # API to create a child user
@@ -93,7 +95,8 @@ def create_child_user_api(parent_user_id):
     db = SessionLocal()
     user = create_user(db, data["name"], parent_user_id, None, data['description'])
     db.close()
-    return jsonify({"id": user.id, "name": user.name, "parent_user_id": user.parent_user_id, "vnc_port": user.novnc_port})
+    return jsonify(
+        {"id": user.id, "name": user.name, "parent_user_id": user.parent_user_id, "vnc_port": user.novnc_port})
 
 
 # API to get tasks for a user
@@ -142,7 +145,9 @@ def main():
     """
     init_db()
     scheduler = BackgroundScheduler()
+    chatService = ChatService()
     scheduler.add_job(func=check_and_create_containers, trigger="interval", minutes=1)
+    scheduler.add_job(func=chatService.check_and_create_users_in_chat, trigger="interval", minutes=1)
     scheduler.start()
     app.run(debug=True)
 

@@ -3,8 +3,10 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from contextlib import contextmanager
 
+from orchestrator.services.data_service import DataService
+
 # Create the SQLAlchemy engine and session
-DATABASE_URL = "sqlite:////home/mehdi/all/repositories/github.com/orchestrator/orchestrator.db"
+DATABASE_URL = "sqlite:///" + DataService().get_orchestrator_path() + "orchestrator.db"
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
