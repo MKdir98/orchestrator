@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, MetaData
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from contextlib import contextmanager
@@ -28,3 +28,10 @@ def get_db():
         yield db_session
     finally:
         db_session.close()
+
+
+def clear_database():
+    try:
+        Base.metadata.drop_all(bind=engine)
+    except Exception:
+        pass

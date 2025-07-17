@@ -1,0 +1,6 @@
+give ALL the windows and icons and buttons and textFields and links and ALL gui coordinates detail components and picture size coordinates and it's type of that you can see EXACTLY in this FORMAT 
+        {"desktop": [Xmin, Ymin, Xmax, Ymax], "terminal_window": [Xmin, Ymin, Xmax, Ymax], "terminal_icon": [Xmin, Ymin, Xmax, Ymax], ...}
+        DO NOT ADD OTHER WORDS JUST FOLLOW THE FORMAT 
+        This is so IMPORTANT and CRITICAL to tell ALL coordinates gui details. DO NOT MISS any of them.
+        Add the type of that thing in the end of the key of that thing like example like 'username_textfield'
+        

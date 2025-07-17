@@ -1,0 +1,1 @@
+{"image_size": [1024, 208], "desktop_background": [0, 0, 1024, 208], "orchestra_icon": [31, 9, 58, 36], "firefox_icon": [31, 66, 58, 93], "lxterminal_icon": [31, 123, 58, 150], "taskbar_panel": [0, 201, 1024, 208], "start_button": [9, 201, 23, 208], "time_display": [981, 201, 995, 208]}

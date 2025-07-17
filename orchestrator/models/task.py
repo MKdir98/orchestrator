@@ -47,6 +47,9 @@ class Task(Base):
         # for test in self.task_messages:
         #     print(test.content)
         return [json.loads(task_message.content) for task_message in self.task_messages]
+    
+    def summary(self):
+        return {"id": self.id, "description": self.description, "user_id": self.user_id, "status": self.status.value, "priority": self.priority}
 
 
 def Message(content, role="assistant"):

@@ -1,0 +1,65 @@
+Analyze this screenshot and respond in this EXACT format:
+
+        Current Objective: Your leader is Mahdi Karami with id=mk_dir98. Text to him\her in messanger and introduce yourself
+        Priority: 0
+
+        Screen Analysis:
+        - [Windows]: [[Describe first visible window and its exact state and it's coordinates], [Describe next visible window and its state and it's coordinates], ...]
+        - [Task UI Elements]: [[Describe first visible element relevant to the task and its state and it's coordinates], [Describe next visible element relevant to the task and its state and it's coordinates], ...]
+        - [ALL UI Elements]: [[Describe first visible element and its state and it's coordinates], [Describe next visible element and its state and it's coordinates], ...] // you MUST tell ALL of the gui detail components
+        - [Result of last action]: [What was the result of the last action base of picture and recent actions part and that was succeed or do you see problems? And if you see problem why this happened and what we can do for this to rollback or handle this situation]
+        - [width and height size of the picture]: [The last x and y of whole picture]
+
+        Task Status: [complete/not complete]
+        Reason: [Explain why task is complete or not]
+        Something should store in memory: [The things you learned from the last actions and it's needed to save in memory]
+
+        Next Actions (list ALL required actions in order):
+
+        1. Action:
+        - Type: [single_click/double_click/right_click/type_text/send_key/wait/create_task/stop/move_mouse/create_employee]
+        - Target: [Specific element or location]
+        - Detail: [Detail of type in text]
+        - Reason: [Why this action is needed]
+        - Pre-Actions: [List any preparation steps]
+        - Post-Actions: [List any follow-up steps]
+        - Thought: [Thought of this action]
+
+        2. Action:
+        - Type: [Next action type]
+        - Target: [Specific element or location]
+        - ...
+
+        Now analyze the screenshot and provide your response in the requested format.
+        Rules to follow:
+        1. ALWAYS maintain this exact format
+        2. List ALL required actions in proper sequence
+        3. Include ALL necessary pre/post actions
+        4. For terminal interactions:
+           - Ensure terminal is focused first
+           - Include appropriate wait times
+        5. For system commands:
+           - Check for errors in response
+        6. Be specific about targets and reasons
+        7. For open apps and files you MUST use double_click instead of single_click
+        8. For errors and something like them you can use create_task to create new task with higher priority.
+        9. If a task with higher priority is created via create_task:
+            - Immediately terminate the current task's action list.
+            - Only output the new task (no other actions or tasks).
+            - Do NOT add subsequent actions to the original task.
+        10. When describing coordinates or locations of icons, windows, or any rectangular area, you must provide all four corner points (top-left, top-right, bottom-right, bottom-left) to precisely define the boundaries of the object. The format should be: [(x1,y1), (x2,y2), (x3,y3), (x4,y4)] where these points represent the four vertices of the rectangle in clockwise or counter-clockwise order.
+        11. Please do not forget details in screen analysis like press enter or click
+        12. Sometimes os got shut down and everything on it got disappeared. So maybe the windows got closed. Consider screenshot detail in .
+        13. Sometimes you see command for enter in command line you should report all of it in the detail of windows
+        14. Actions must be explicit and deterministic—no conditionals (e.g., 'if', 'or') or ambiguity. Define all possible paths as separate, concrete steps (e.g., 'double_click icon_X' OR 'run command_Y'), but never combine them conditionally.
+        15. If you want to open an app you can use application menu or desktop or terminal to open it.
+        16. The current task state is defined by the provided Recent Actions; before executing any UI‑ or system‑altering Action, you must review the Recent Actions to understand the context, perform a quick Screen Analysis or CLI check to confirm the actual system/UI state, and then select the next Action that aligns with both the Recent Actions history and the verified state.
+        17. For downloading big files first check this address in your firefox `ftp://ftp-server:20` username: myuser password: mypassword
+        18. A messenger in the http://rocketchat:3000 is up. And you should check it times to times. Your lead will give you messages in there. And sometimes for some interaction with others you will need it. Your username is mahdi_karami and password is `mypassword`
+        19. Because this image is just image probably you don't see cursor. So for some of actions write single_click in their pre-actions.
+
+        Current task objective: Your leader is Mahdi Karami with id=mk_dir98. Text to him\her in messanger and introduce yourself
+        Priority: 0
+        Coordinates of the picture(You should use this to generate the response that I want): {"image_size": [1024, 208], "desktop_background": [0, 0, 1024, 208], "orchestra_icon": [31, 9, 58, 36], "firefox_icon": [31, 66, 58, 93], "lxterminal_icon": [31, 123, 58, 150], "taskbar_panel": [0, 201, 1024, 208], "start_button": [9, 201, 23, 208], "time_display": [981, 201, 995, 208]}
+        
+        

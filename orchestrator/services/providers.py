@@ -1,12 +1,6 @@
 import os
-from dotenv import load_dotenv
 
-from orchestrator.services.llm_provider import OpenAIBaseProvider, AnthropicBaseProvider, MistralBaseProvider
-
-# Load environment variables from .env file
-load_dotenv()
-
-# LLM providers use the OpenAI specification and require a base URL:
+from orchestrator.services.llm_provider import OpenAIBaseProvider, AnthropicBaseProvider, MistralBaseProvider, OllamaProvider
 
 
 class LlamaProvider(OpenAIBaseProvider):
@@ -20,7 +14,7 @@ class OpenRouterProvider(OpenAIBaseProvider):
     api_key = os.getenv("OPENROUTER_API_KEY")
     aliases = {
         "llama-3.2": "meta-llama/llama-3.2-90b-vision-instruct",
-        "qwen-2.5-vl":"qwen/qwen2.5-vl-72b-instruct:free",
+        "qwen-2.5-vl": "qwen/qwen2.5-vl-72b-instruct:free",
         "google/gemini-2.0-flash-001": "mistralai/mistral-small-3.1-24b-instruct:free",
     }
 
@@ -83,3 +77,41 @@ class MoonshotProvider(OpenAIBaseProvider):
         "moonshot-v1": "moonshot-v1-128k",
         "moonshot-v1-vision": "moonshot-v1-128k-vision-preview",
     }
+
+
+class LocalOllamaProvider(OllamaProvider):
+    """
+    Local Ollama provider for Qwen and other vision models
+    """
+    aliases = {
+        "qwen2.5vl:3b": "qwen2.5vl:3b",
+        "qwen2.5:7b": "qwen2.5:7b",
+        "qwen2.5:14b": "qwen2.5:14b", 
+        "qwen2.5:32b": "qwen2.5:32b",
+        "qwen2.5-vl:7b": "qwen2.5-vl:7b",
+        "qwen2.5-vl:14b": "qwen2.5-vl:14b",
+        "llama3.2:3b": "llama3.2:3b",
+        "llama3.2:8b": "llama3.2:8b",
+        "llama3.2:70b": "llama3.2:70b",
+        "llama3.2-vision:3b": "llama3.2-vision:3b",
+        "llama3.2-vision:8b": "llama3.2-vision:8b",
+        "llama3.2-vision:70b": "llama3.2-vision:70b",
+        "gemma2:2b": "gemma2:2b",
+        "gemma2:9b": "gemma2:9b",
+        "gemma2:27b": "gemma2:27b",
+        "mistral:7b": "mistral:7b",
+        "mistral:8x7b": "mistral:8x7b",
+        "mistral:large": "mistral:large",
+        "codellama:7b": "codellama:7b",
+        "codellama:13b": "codellama:13b",
+        "codellama:34b": "codellama:34b",
+        "phi3:mini": "phi3:mini",
+        "phi3:small": "phi3:small",
+        "phi3:medium": "phi3:medium",
+        "phi3:vision": "phi3:vision",
+    }
+    
+    def __init__(self, model="qwen2.5vl:3b"):
+        # Map model alias to actual model name
+        actual_model = self.aliases.get(model, model)
+        super().__init__(actual_model)

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy import Column, Integer, String, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 from .base import Base, SessionLocal
 
@@ -12,7 +12,9 @@ class User(Base):
     group_id = Column(Integer, ForeignKey("groups.id"))
     vnc_port = Column(Integer, unique=True)
     novnc_port = Column(Integer, unique=True)
-    description = Column(String, nullable=True)  # اضافه کردن فیلد description
+    description = Column(String, nullable=True)
+    continue_automatically = Column(Boolean, default=False)
+    status = Column(String, default="IDLE")  # وضعیت کاربر: IN_PROGRESS یا IDLE
 
     # Relationships
     group = relationship("Group", back_populates="users")
@@ -29,3 +31,7 @@ class User(Base):
         db_session.add(self)
         db_session.commit()
         db_session.close()
+
+    def summary(self):
+        return {"id": self.id, "name": self.name, "parent_user_id": self.parent_user_id, "vnc_port": self.novnc_port,
+                "continue_automatically": self.continue_automatically, "status": self.status}

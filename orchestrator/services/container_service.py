@@ -2,7 +2,7 @@ import docker
 import os
 import socket
 
-from orchestrator.models.base import SessionLocal, get_db
+from orchestrator.services.websocket_service import websocket_manager
 
 
 class ContainerService:
@@ -11,7 +11,11 @@ class ContainerService:
 
     def find_container_by_user(self, user):
         try:
-            container = self.client.containers.get(f"orchestrator_container_{user.id}")
+            # Get MODE from environment variables, default to 'dev' if not set
+            mode = os.getenv('MODE', 'dev')
+            container_name = f"orchestrator_container_{mode}_{user.id}"
+            
+            container = self.client.containers.get(container_name)
             if container.status != "running":
                 container.start()
             return container
@@ -26,12 +30,17 @@ class ContainerService:
                 os.path.dirname(os.path.abspath(__file__)), "data", str(user.id)
             )
             os.makedirs(user_data_dir, exist_ok=True)
+            
+            # Get MODE from environment variables, default to 'dev' if not set
+            mode = os.getenv('MODE', 'dev')
+            container_name = f"orchestrator_container_{mode}_{user.id}"
+            
             container = self.client.containers.run(
                 image="karam_orchestrator:latest",
                 command="sleep infinity",
                 detach=True,
                 network="orchestrator_default",
-                name=f"orchestrator_container_{user.id}",
+                name=container_name,
                 ports={
                     "80/tcp": novnc_port,
                     "5900/tcp": vnc_port
@@ -41,16 +50,14 @@ class ContainerService:
                         "bind": "/root/Desktop/orchestrator/data",
                         "mode": "rw",
                     }
-                },
-                environment={
-                    "RESOLUTION": "1920x1080"
                 }
             )
             user.vnc_port = vnc_port
-
             user.novnc_port = novnc_port
             session.add(user)
             session.commit()
+            from orchestrator.services.group_service import GroupService
+            GroupService().update_group_for_websockets(user.group)
             return container
         except Exception as e:
             print(f"Failed to create container for user '{user.name}': {e}")

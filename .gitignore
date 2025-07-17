@@ -1,6 +1,6 @@
 /.env
 /orchestrator.db
-/orchestrator/services/data/
+/orchestrator_data/
 /.idea
 /poetry.lock
 __pycache__/

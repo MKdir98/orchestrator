@@ -1,10 +1,10 @@
 from g4f import ProviderType
-from g4f.Provider import Glider, AllenAI, Blackbox, PollinationsAI, OIVSCode, DeepInfraChat, Dynaspark, HuggingFace, \
-    HuggingFaceAPI
+from g4f.Provider import OIVSCodeSer0501, PollinationsAI
 from gradio_client import Client, handle_file
 from openai import OpenAI
 from anthropic import Anthropic
 import traceback
+import requests
 
 from PIL import Image
 import io
@@ -14,6 +14,7 @@ import base64
 import g4f
 import os
 
+from orchestrator.models.har import NewHarProvider
 from orchestrator.services.qwen_service import HF_TOKEN
 
 
@@ -259,7 +260,10 @@ class MistralBaseProvider(OpenAIBaseProvider):
 class G4FProvider(LLMProvider):
 
     def create_client(self):
+        # return g4f.Client(NewHarProvider).chat.completions
+        # return g4f.Client(OIVSCodeSer5).chat.completions
         return g4f.Client(PollinationsAI).chat.completions
+        # return g4f.Client(OIVSCodeSer0501).chat.completions
 
     def call(self, message, image, tools=None):
         imageData = [[open(image, "rb"), 'picture.png']]
@@ -267,14 +271,14 @@ class G4FProvider(LLMProvider):
             exampleFakeData = '''
                 [{
                     "name":"click" , // you MUST use 'name'
-                    "parameters": { // DONT answer with 'params'
+                    "parameters": { // DONT ANSWER WITH 'params' AS KEY JUST USE "parameters"
                         "x": "111", "y": "222",
                         "last_action_result": "test last action result",
                         "image_width": "1234",
                         "image_height": "4321",
                         "description": "Fake reason"
                     }
-                }]
+                }, ...]
                 '''
             tool_calls_prompt = (
                     'The format of the response is should be EXACT like this: Example of response with fake data: ' +
@@ -282,9 +286,19 @@ class G4FProvider(LLMProvider):
                 tools) + '')
             message = message + tool_calls_prompt
 
-        response = self.client.create(
-            message, 'openai-large', images=imageData).choices[0].message.content  ## That was not great
+        # response = self.client.create(
+        #     message, 'openai-large', images=imageData).choices[0].message.content  ## That was not great
 
+        response = self.client.create(
+            message, 
+            # 'qwen2.5-vl-32b-instruct',
+            '',
+            # '',
+            # 'o3-2025-04-16',
+            # 'claude-3-7-sonnet-20250219',
+            # 'gemini-2.5-flash-preview-04-17',
+            images=imageData).choices[0].message.content  ## That was not great
+        
         print(message, response)
         if tools is not None:
             if response[0:3] == '```':
@@ -292,7 +306,10 @@ class G4FProvider(LLMProvider):
             else:
                 return ['', json.loads(response)]
         else:
-            return response
+            if response[0:3] == '```':
+                return response[7:-3]
+            else:
+                return response
 
 
 class HuggingFaceProvider(LLMProvider):
@@ -312,7 +329,7 @@ class HuggingFaceProvider(LLMProvider):
                     }]
                     '''
             tool_calls_prompt = (
-                    'The format of the response is should be EXACT like this: Example of response with fake data: ' +
+                    'The format of the response (array of jsonObject) is should be EXACT like this: Example of response with fake data: ' +
                     exampleFakeData + '. These are the list of functions that always you MUST use in your json response: ' + json.dumps(
                 tools) + '')
             message = message + tool_calls_prompt
@@ -325,14 +342,220 @@ class HuggingFaceProvider(LLMProvider):
             api_name="/chat"
         )
 
-        print(messages, response)
+        print(message, response)
         if tools is not None:
             if response[0:3] == '```':
                 return ['', json.loads(response[7:-3])]
             else:
                 return ['', json.loads(response)]
         else:
-            return response
+            if response[0:3] == '```':
+                return response[7:-3]
+            else:
+                return response
 
     def create_client(self):
         return Client("prithivMLmods/Qwen2.5-VL-7B-Instruct", hf_token=HF_TOKEN)
+
+
+class OllamaProvider(LLMProvider):
+    """
+    Provider for local Ollama models with image support
+    Supports Qwen and other vision models running locally
+    """
+    
+    def __init__(self, model="qwen2.5vl:3b"):
+        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        self.model = model
+        print(f"Using OllamaProvider with {self.model} at {self.base_url}")
+        self.client = self.create_client()
+    
+    def create_client(self):
+        """Create Ollama client - using requests for simplicity"""
+        return None  # We'll use requests directly
+    
+    def create_image_block(self, image_data: bytes):
+        """Convert image to base64 for Ollama"""
+        # Use Pillow to detect the image type
+        image_type = "png"  # Default to PNG if detection fails
+        try:
+            with Image.open(io.BytesIO(image_data)) as img:
+                image_type = img.format.lower()
+        except Exception as e:
+            print(f"Error detecting image type: {e}")
+
+        # Base64-encode the raw image bytes
+        encoded = base64.b64encode(image_data).decode("utf-8")
+        return {
+            "type": "image",
+            "data": encoded
+        }
+    
+    def transform_messages_for_ollama(self, messages):
+        """Transform messages to Ollama format"""
+        ollama_messages = []
+        
+        for message in messages:
+            if message.get("role") == "system":
+                # Ollama doesn't have system messages, convert to user message
+                ollama_messages.append({
+                    "role": "user",
+                    "content": f"System: {message['content']}"
+                })
+            elif message.get("role") in ["user", "assistant"]:
+                content = message["content"]
+                
+                # Handle multimodal content (text + images)
+                if isinstance(content, list):
+                    # Combine text and images
+                    text_parts = []
+                    images = []
+                    
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                text_parts.append(block["text"])
+                            elif block.get("type") == "image_url":
+                                # Extract base64 from data URL
+                                url = block["image_url"]["url"]
+                                if url.startswith("data:image/"):
+                                    base64_data = url.split(",", 1)[1]
+                                    images.append(base64_data)
+                            elif block.get("type") == "image":
+                                images.append(block["data"])
+                        else:
+                            text_parts.append(str(block))
+                    
+                    # Combine text parts
+                    combined_text = " ".join(text_parts)
+                    
+                    # Create Ollama message
+                    ollama_message = {
+                        "role": message["role"],
+                        "content": combined_text
+                    }
+                    
+                    # Add images if present
+                    if images:
+                        ollama_message["images"] = images
+                    
+                    ollama_messages.append(ollama_message)
+                else:
+                    # Simple text message
+                    ollama_messages.append({
+                        "role": message["role"],
+                        "content": str(content)
+                    })
+        
+        return ollama_messages
+    
+    def call(self, messages, image_path=None, tools=None):
+        """
+        Call Ollama API with support for images and tools
+        
+        Args:
+            messages: List of message dictionaries
+            image_path: Optional path to image file
+            tools: Optional tools/functions definition
+        """
+        try:
+            # Handle both string and list formats
+            if isinstance(messages, str):
+                # Simple string message
+                ollama_messages = [{"role": "user", "content": messages}]
+            else:
+                # List of message dictionaries
+                ollama_messages = self.transform_messages_for_ollama(messages)
+            
+            # Prepare request payload
+            payload = {
+                "model": self.model,
+                "messages": ollama_messages,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "num_predict": 2048
+                }
+            }
+            
+            # Add tools if provided
+            if tools:
+                # Convert tools to Ollama format
+                ollama_tools = []
+                for name, details in tools.items():
+                    tool_def = {
+                        "name": name,
+                        "description": details.get("description", ""),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    }
+                    
+                    # Convert parameters
+                    for param_name, param_desc in details.get("params", {}).items():
+                        tool_def["parameters"]["properties"][param_name] = {
+                            "type": "string",
+                            "description": param_desc
+                        }
+                        tool_def["parameters"]["required"].append(param_name)
+                    
+                    ollama_tools.append(tool_def)
+                
+                payload["tools"] = ollama_tools
+            
+            # Add image if provided
+            if image_path and os.path.exists(image_path):
+                with open(image_path, "rb") as f:
+                    image_data = f.read()
+                    base64_image = base64.b64encode(image_data).decode("utf-8")
+                    
+                    # Add image to the last user message
+                    if ollama_messages and ollama_messages[-1]["role"] == "user":
+                        if "images" not in ollama_messages[-1]:
+                            ollama_messages[-1]["images"] = []
+                        ollama_messages[-1]["images"].append(base64_image)
+                        payload["messages"] = ollama_messages
+            
+            # Make request to Ollama
+            response = requests.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=120
+            )
+            
+            if response.status_code != 200:
+                raise Exception(f"Ollama API error: {response.status_code} - {response.text}")
+            
+            result = response.json()
+            
+            # Extract response
+            if "message" in result:
+                content = result["message"].get("content", "")
+                
+                # Handle tool calls if present
+                if tools and "tool_calls" in result["message"]:
+                    tool_calls = []
+                    for tool_call in result["message"]["tool_calls"]:
+                        tool_calls.append({
+                            "type": "function",
+                            "name": tool_call["name"],
+                            "parameters": tool_call.get("args", {})
+                        })
+                    return content, tool_calls
+                
+                return content
+            
+            return ""
+            
+        except Exception as e:
+            print(f"Error calling Ollama: {e}")
+            traceback.print_exc()
+            return f"Error: {str(e)}"
+    
+    def completion(self, messages, **kwargs):
+        """Compatibility method for the base class"""
+        return self.call(messages)

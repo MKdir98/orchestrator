@@ -1,0 +1,11 @@
+[{
+    "name": "single_click",
+    "parameters": {
+        "x": "45", "y": "79",
+        "last_action_result": "No previous action visible in the screenshot. Desktop is showing with no active applications.",
+        "image_width": "1024",
+        "image_height": "208",
+        "description": "Click on the Firefox icon to open the browser",
+        "memory_data": "The leader's ID is mk_dir98. The messenger is at http://rocketchat:3000. Login credentials are username: mahdi_karami and password: mypassword."
+    }
+}]

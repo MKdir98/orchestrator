@@ -2,24 +2,19 @@ from logging.config import fileConfig
 import os
 import sys
 
-# اضافه کردن مسیر پروژه به Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from alembic import context
 
-# این خط را حتماً قبل از import مدل‌ها قرار دهید
 from orchestrator.models.base import Base
 
-# تنظیمات Alembic
 config = context.config
 
-# تنظیمات لاگینگ
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# این بخش حیاتی است - باید به درستی تنظیم شود
 target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
@@ -45,6 +40,7 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        print(connection.engine.url)
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

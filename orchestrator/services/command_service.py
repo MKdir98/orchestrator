@@ -148,6 +148,34 @@ class CommandService:
         asyncio.run(async_click())
 
     @staticmethod
+    def scroll_up(repeat, current_user_id: int):
+        db = SessionLocal()
+
+        user = db.query(User).filter(User.id == current_user_id).first()
+        if not user:
+            raise ValueError(f"User with ID {current_user_id} not found.")
+
+        async def async_click():
+            async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
+                client.mouse.scroll_up(repeat)
+
+        asyncio.run(async_click())
+
+    @staticmethod
+    def scroll_down(repeat, current_user_id: int):
+        db = SessionLocal()
+
+        user = db.query(User).filter(User.id == current_user_id).first()
+        if not user:
+            raise ValueError(f"User with ID {current_user_id} not found.")
+
+        async def async_click():
+            async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
+                client.mouse.scroll_down(repeat)
+
+        asyncio.run(async_click())
+
+    @staticmethod
     def double_click(x, y, current_user_id: int):
         db = SessionLocal()
 

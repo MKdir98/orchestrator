@@ -1,0 +1,173 @@
+Based on the recent actions and screenshot analysis and task objective, determine the next action to take.
+
+                    Screenshot analysis:
+                    Current Objective: Your leader is Mahdi Karami with id=mk_dir98. Text to him\her in messanger and introduce yourself
+Priority: 0
+
+Screen Analysis:
+- [Windows]: [No active windows visible on screen, only desktop with icons and taskbar, [(0, 0), (1024, 208)]]
+- [Task UI Elements]: [Firefox icon, [(31, 66), (58, 93)], Taskbar panel, [(0, 201), (1024, 208)]]
+- [ALL UI Elements]: [Desktop background, [(0, 0), (1024, 208)], Orchestra icon, [(31, 9), (58, 36)], Firefox icon, [(31, 66), (58, 93)], LXTerminal icon, [(31, 123), (58, 150)], Taskbar panel, [(0, 201), (1024, 208)], Start button, [(9, 201), (23, 208)], Time display showing 11:09, [(981, 201), (995, 208)]]
+- [Result of last action]: No previous action visible in the screenshot. Desktop is showing with no active applications.
+- [width and height size of the picture]: [1024, 208]
+
+Task Status: not complete
+Reason: Need to open Firefox, navigate to the Rocket Chat messenger at http://rocketchat:3000, login with credentials (mahdi_karami/mypassword), and send a message to Mahdi Karami (mk_dir98).
+
+Something should store in memory: The leader's ID is mk_dir98. The messenger is at http://rocketchat:3000. Login credentials are username: mahdi_karami and password: mypassword.
+
+Next Actions (list ALL required actions in order):
+
+1. Action:
+- Type: double_click
+- Target: Firefox icon
+- Detail: N/A
+- Reason: Need to open Firefox browser to access the messenger website
+- Pre-Actions: single_click on desktop to ensure focus
+- Post-Actions: Wait for Firefox to load completely
+- Thought: Firefox needs to be opened first to access the web-based messenger
+
+2. Action:
+- Type: wait
+- Target: Firefox window
+- Detail: Wait 3 seconds
+- Reason: Need to ensure Firefox is fully loaded before entering URL
+- Pre-Actions: None
+- Post-Actions: None
+- Thought: Giving Firefox time to initialize properly
+
+3. Action:
+- Type: type_text
+- Target: Firefox address bar
+- Detail: http://rocketchat:3000
+- Reason: Need to navigate to the Rocket Chat messenger website
+- Pre-Actions: single_click on address bar to focus it
+- Post-Actions: None
+- Thought: Entering the URL for the messenger application
+
+4. Action:
+- Type: send_key
+- Target: Firefox address bar
+- Detail: Enter
+- Reason: Submit the URL to navigate to the messenger website
+- Pre-Actions: None
+- Post-Actions: Wait for page to load
+- Thought: Submitting the URL to navigate to Rocket Chat
+
+5. Action:
+- Type: wait
+- Target: Rocket Chat login page
+- Detail: Wait 3 seconds
+- Reason: Need to ensure the login page is fully loaded
+- Pre-Actions: None
+- Post-Actions: None
+- Thought: Giving the page time to load completely
+
+6. Action:
+- Type: type_text
+- Target: Username field
+- Detail: mahdi_karami
+- Reason: Need to enter username for login
+- Pre-Actions: single_click on username field
+- Post-Actions: None
+- Thought: Entering the provided username credentials
+
+7. Action:
+- Type: type_text
+- Target: Password field
+- Detail: mypassword
+- Reason: Need to enter password for login
+- Pre-Actions: single_click on password field
+- Post-Actions: None
+- Thought: Entering the provided password credentials
+
+8. Action:
+- Type: single_click
+- Target: Login button
+- Detail: N/A
+- Reason: Submit login credentials to access the messenger
+- Pre-Actions: None
+- Post-Actions: Wait for login to complete
+- Thought: Submitting credentials to log into Rocket Chat
+
+9. Action:
+- Type: wait
+- Target: Rocket Chat main interface
+- Detail: Wait 3 seconds
+- Reason: Need to ensure the main interface is fully loaded after login
+- Pre-Actions: None
+- Post-Actions: None
+- Thought: Giving the application time to load the main interface
+
+10. Action:
+- Type: single_click
+- Target: Search or direct message field
+- Detail: N/A
+- Reason: Need to find Mahdi Karami to send a message
+- Pre-Actions: None
+- Post-Actions: None
+- Thought: Accessing the search function to find the team leader
+
+11. Action:
+- Type: type_text
+- Target: Search field
+- Detail: mk_dir98
+- Reason: Searching for the leader by their ID
+- Pre-Actions: None
+- Post-Actions: None
+- Thought: Using the leader's ID to find them in the messenger
+
+12. Action:
+- Type: single_click
+- Target: Mahdi Karami in search results
+- Detail: N/A
+- Reason: Open chat with the team leader
+- Pre-Actions: None
+- Post-Actions: None
+- Thought: Selecting the leader from search results to open a direct message
+
+13. Action:
+- Type: type_text
+- Target: Message input field
+- Detail: Hello Mahdi Karami, I'm introducing myself as requested. I'm ready to assist with any tasks you may have for me. Please let me know how I can help.
+- Reason: Introducing self to the team leader as required in the objective
+- Pre-Actions: single_click on message input field
+- Post-Actions: None
+- Thought: Composing an appropriate introduction message
+
+14. Action:
+- Type: send_key
+- Target: Message input field
+- Detail: Enter
+- Reason: Send the introduction message to the team leader
+- Pre-Actions: None
+- Post-Actions: None
+- Thought: Submitting the message to complete the task objective
+
+
+                    Rules to follow:
+                    1. If a task with a higher priority number (higher urgency) is created via create_task:
+                        - Immediately terminate the current task's action list.
+                        - Only output the new task (no other actions or tasks).
+                        - Do NOT add subsequent actions to the original task.
+                    2. Pre-actions are CRITICAL – They determine if the main action can execute. But before that check recent actions maybe it happened in the past
+                    3. Window Focus Requirement:
+                        - If pre-actions specify focusing on a particular window:
+                            - Physically click on the **window itself** (not its icon or other UI elements).
+                            - Example: For "LX Terminal," click the terminal window, not the LX Terminal icon.
+                            - Verify focus by checking window attributes (title, active state) before proceeding.
+                    4. In send_key for enter something you should use `Return` word
+                    5. If you want apps opened in the taskbar you should say it's name that you hve in screenshot analysis
+                    6. For ensure the apps is focused you need to click on them before the main action. But before that check recent actions maybe it happened in the past
+                    7. For each action of screenshot thought you should give me one action
+                    8. For click or open something click on center of it
+                    9. Before executing any Pre-Action (e.g., clicking to Focus), always check if the same action exists in Recent Actions. If present, do NOT repeat it."
+                    10. Try to use EXACTLY the actions that I told you in the prompt. double_click => double_click
+                    11. For more accuracy you should just answer one action.(just for pre-focus on windows you can use one more action before the real action)
+                    12. In some scenarios like type(with have single_click or hover in their pre-action) you can use several actions in SAFE mode.
+                    13. For clicking in text fields or typing in somewhere you should have two action for that. One for click on it then type in it
+
+
+                    Current task objective: Your leader is Mahdi Karami with id=mk_dir98. Text to him\her in messanger and introduce yourself
+                    Priority: 0
+                    Determine next action using available tools.

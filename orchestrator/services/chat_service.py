@@ -1,12 +1,10 @@
 import json, requests, os
-from dotenv import load_dotenv
+from sqlalchemy.testing.suite.test_reflection import users
 
 from orchestrator.models.base import SessionLocal
 from orchestrator.models import User
 from orchestrator.services.processor_service import ProcessorService
 from orchestrator.services.task_service import TaskService
-
-load_dotenv()
 
 
 class ChatService:
@@ -14,7 +12,7 @@ class ChatService:
         db = SessionLocal()
         try:
             users = db.query(User).all()
-            usernames = self.users()
+            usernames = list(map(lambda user: user['username'], self.users()))
             for user in users:
                 username = user.name.replace(' ', '_').lower()
                 if not username in usernames:
@@ -84,5 +82,31 @@ class ChatService:
         }
 
         response = requests.request("GET", url, headers=headers, data=payload)
+        users_list = list(map(lambda x: {'username': x['username'], 'id': x['_id'], 'name': x['name']},
+                              filter(lambda x: 'admin' not in x['roles'] and x['type'] == 'user',
+                                     json.loads(response.text)['users'])))
+        return users_list
+
+    def user_delete(self, userId: str):
+        url = os.getenv(
+            'ROCKET_CHAT_ADDRESS') + "/api/v1/users.delete"
+
+        payload = json.dumps({
+            "userId": userId,
+            "confirmRelinquish": False
+        })
+        headers = {
+            'X-Auth-Token': os.getenv("ROCKET_CHAT_AUTH_TOKEN"),
+            'sec-ch-ua-platform': '"Linux"',
+            'X-User-Id': os.getenv("ROCKET_CHAT_USER_ID"),
+            'Referer': 'http://localhost:3000/admin/users',
+            'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
+            'sec-ch-ua-mobile': '?0',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+
+        response = requests.request("POST", url, headers=headers, data=payload)
+
         print(response.text)
-        return map(lambda x: x['username'], json.loads(response.text)['users'])
