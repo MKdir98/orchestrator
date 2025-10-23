@@ -14,8 +14,6 @@ import base64
 import g4f
 import os
 
-from orchestrator.models.har import NewHarProvider
-from orchestrator.services.qwen_service import HF_TOKEN
 
 
 def Message(content, role="assistant"):
@@ -292,7 +290,7 @@ class G4FProvider(LLMProvider):
         response = self.client.create(
             message, 
             # 'qwen2.5-vl-32b-instruct',
-            '',
+            'o4-mini',
             # '',
             # 'o3-2025-04-16',
             # 'claude-3-7-sonnet-20250219',

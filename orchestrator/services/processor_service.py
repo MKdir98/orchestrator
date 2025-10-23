@@ -3,6 +3,7 @@ import tempfile
 import cv2
 import numpy as np
 import pytesseract
+import re
 
 from PIL import Image, ImageDraw
 from sqlalchemy import or_
@@ -22,12 +23,14 @@ from orchestrator.models.base import SessionLocal
 from orchestrator.models.task import TaskStatus, Task, TaskMessage
 from orchestrator.services.command_service import CommandService
 from orchestrator.services.config_service import grounding_model, vision_model, action_model, position_model
+from orchestrator.services.container_service import ContainerService
 from orchestrator.services.data_service import DataService
 from orchestrator.services.element_memory_service import get_element_memory_service
 from orchestrator.models.memory import Memory
 from orchestrator.services.group_service import GroupService
 from orchestrator.services.log_service import logService
 from orchestrator.services.rag_service import RAGSystem
+from orchestrator.services.shared_learning_service import SharedLearningService
 from orchestrator.models.user import User
 from orchestrator.services.user_service import create_user
 from orchestrator.services.websocket_service import websocket_manager, WebSocketManager
@@ -99,9 +102,9 @@ tools = {
         }
     },
     "send_key": {
-        "description": "Send keyboard key. The main keys are: Enter Escape Shift Alt Ctrl Tab",
+        "description": "Send keyboard key(s). Can send single keys or key combinations (like Ctrl+L). For combinations, pass multiple keys.",
         "parameters": {
-            "name": "Key name",
+            "keys": "List of keys to press. Single key: ['Enter'] or ['Escape']. Combinations: ['Control_L', 'l'] for Ctrl+L, ['Alt_L', 'Tab'] for Alt+Tab, ['Shift_L', 'a'] for Shift+A. Common keys: Enter, Escape, Tab, BackSpace, Delete, Return. Modifiers: Control_L, Alt_L, Shift_L, Super_L",
         }
     },
     "create_task": {
@@ -138,9 +141,13 @@ class ProcessorService:
         self.model_width = None
         self.model_height = None
         self.task_rag = RAGSystem()
+        self.shared_learning = SharedLearningService()
         self.step_id = 0
         self.websocket_manager = websocket_manager
         
+        # برای ذخیره آخرین action و expected outcome
+        self.last_action_info = {}
+
         # اضافه کردن checkpoint system
         self.checkpoint_data = {}
         self.processing_stage = "start"  # start, position, vision, action, complete
@@ -328,342 +335,241 @@ class ProcessorService:
         CommandService.typing(text, self.user_id)
         return f"Typed: {text[:50]}..."
 
-    def send_key(self, name, description):
-        return CommandService.send_key(name, self.user_id)
+    def send_key(self, keys, description):
+        """
+        Send keyboard key(s) via VNC.
+        
+        Args:
+            keys: List of keys to press (e.g., ['Control_L', 'l'] for Ctrl+L)
+            description: Reason for sending keys
+        """
+        # Ensure keys is a list
+        if isinstance(keys, str):
+            keys = [keys]
+        return CommandService.send_key(keys, self.user_id)
 
     def append_screenshot(self):
         time.sleep(1)
         CommandService.screenshot(self.user_id)
-        enhanced_prompt = self.task_rag.query_context(
+        
+        # دریافت context از RAG (سرچ سمانتیک)
+        rag_context = self.task_rag.query_context(
             self.user_id, f"Memory data: {self.current_task.description}"
         )
+        
+        # دریافت ۱۰ event اخیر بر اساس timestamp
+        recent_events = self.task_rag.get_recent_events(self.user_id, limit=10)
+        
+        # ترکیب اطلاعات برای enhanced_prompt
+        enhanced_prompt = ""
+        
+        if rag_context:
+            enhanced_prompt += f"\n=== Related Context from Memory ===\n{rag_context}\n"
+        
+        if recent_events:
+            enhanced_prompt += "\n=== Recent 10 Events (Chronological) ===\n"
+            for i, event in enumerate(recent_events, 1):
+                metadata = event.get('metadata', {})
+                task_info = f"[Task {metadata.get('task_id')}: {metadata.get('task_description', 'N/A')}]" if metadata.get('task_id') else "[No Task Info]"
+                event_type = metadata.get('event_type', 'unknown')
+                timestamp = metadata.get('timestamp', 'N/A')
+                content = event.get('content', '')
+                enhanced_prompt += f"{i}. {task_info} [{event_type}] {timestamp}\n   {content}\n"
+            enhanced_prompt += "===\n"
 
-        # پردازش درخواست position با استفاده از تابع process_position_request
-        coordinates = self.process_position_request(
-            self.user_id,
+        detector_raw_data = json.loads(self.getCoordinatesFromDetector())
+        
+        # استخراج ابعاد صفحه از detector data
+        desktop_info = detector_raw_data.get('desktop_info', {})
+        screen_resolution = desktop_info.get('screen_resolution', {})
+        if screen_resolution.get('width') and screen_resolution.get('height'):
+            self.model_width = float(screen_resolution['width'])
+            self.model_height = float(screen_resolution['height'])
+            print(f"Screen dimensions from detector: {self.model_width}x{self.model_height}")
+        
+        # Pre-filter detector data before compression
+        detector_coordinates = self.prefilter_detector_data(detector_raw_data, self.current_task.description)
+
+
+        # رسم rectangles برای لاگ (Detector coordinates)
+        detector_output_path = DataService().get_user_path_screenshot_with_coordinates(self.user_id, self.step_id)
+        details = self.draw_rectangles_on_image(
             DataService().get_user_path_screenshot(self.user_id),
-            DataService().get_user_path_screenshot_with_coordinates(self.user_id, self.step_id)
+            detector_raw_data,  # Use original data for visualization
+            detector_output_path
         )
 
-        # Discovery Phase: شناسایی المان‌های ناشناخته
-        # این مرحله پس از position_request انجام میشه تا discovery data در position تداخل نکنه
-        self.perform_element_discovery(coordinates, DataService().get_user_path_screenshot(self.user_id))
-        
-        # فیلتر کردن coordinates برای vision model (حذف discovery metadata)
-        clean_coordinates = self.filter_coordinates_for_vision(coordinates)
+        # لاگ اطلاعات Detector coordinates
+        real_width, real_height = self.get_image_dimensions(DataService().get_user_path_screenshot(self.user_id))
+        if details != {}:
+            logService.append_log(self.step_id, self.current_task.id,
+                                  f'real_width: {real_width}, real_height: {real_height}, Detector detected elements: {len(detector_coordinates)}, detail: {details}',
+                                  'detector_coordinates',
+                                  detector_output_path)
+
+        # Discovery Phase: اجرای discovery و ساخت enhanced coordinates برای vision
+        # enhanced_coordinates = self.perform_element_discovery_for_vision(detector_coordinates,
+        #                                                                  DataService().get_user_path_screenshot(
+        #                                                                      self.user_id))
 
         user = self.db.query(User).filter(User.id == self.user_id).first()
         username = user.name.replace(' ', '_').lower()
-        vision_prompt = f'''Analyze this screenshot with extreme precision and provide a detailed response in this EXACT format:
 
-        ENHANCED CHARACTER-LEVEL ANALYSIS:
-        You have access to detailed coordinate information including:
-        - Individual character positions and content
-        - Word-level coordinates and text
-        - Cursor positions when visible
-        - Text field states (focused/unfocused, selection)
-        - Element-level content analysis
+        # Compress detector coordinates for vision model
+        compressed_coordinates = self.compress_coordinates_for_vision(detector_coordinates, self.current_task.description)
         
-        Use this information to provide:
-        - Exact text content for each element
-        - Character-by-character positioning data
-        - Cursor location within text fields
-        - Text selection ranges if any
-        - Focus states and visual indicators
-        - Content validation states
-        - Character count and text length for fields
-        - Word boundaries and spacing information
+        # Parse compressed data to create readable summary
+        coord_summary = self.create_coordinate_summary(compressed_coordinates)
+        
+        # دریافت shared mistakes مرتبط با task
+        relevant_mistakes = self.shared_learning.get_relevant_mistakes(
+            self.current_task.description, 
+            top_k=3
+        )
+        mistakes_context = self.shared_learning.format_mistakes_for_prompt(relevant_mistakes)
+        
+        # ساخت قسمت Last Action Validation
+        last_action_validation = ""
+        if self.last_action_info:
+            last_action_validation = f'''
+=== LAST ACTION VALIDATION (CRITICAL - Must Answer First) ===
+Previous Action: {self.last_action_info.get('action_type', 'N/A')} at coordinates {self.last_action_info.get('coordinates', 'N/A')}
+Expected Outcome: {self.last_action_info.get('expected_outcome', 'N/A')}
 
-        CRITICAL FILE IDENTIFICATION RULES:
-        1. DISTINGUISH FILES FROM UI TEXT:
-           - Look for file icons with extensions (.txt, .pdf, .doc, etc.)
-           - Desktop files are typically smaller icons (16x16 to 64x64) with file names
-           - UI text labels are part of application interface (terminal prompts, status text, etc.)
-           - File manager or desktop context indicates actual files
-           - Check for file-like visual appearance (document icons, folder icons)
-        
-        2. TASK-AWARE FILE DETECTION:
-           - Current task mentions: "{self.current_task.description}"
-           - Prioritize identifying files mentioned in the task objective
-           - Look specifically for files with names matching task requirements
-           - Consider file location context (desktop vs application UI)
-        
-        3. VALIDATION CRITERIA:
-           - Files should have file extensions in their visual representation
-           - Files are typically on desktop, in file managers, or folder windows
-           - Terminal/application text labels are NOT files - they are UI elements
-           - Files can be double-clicked to open, labels are static text
+MANDATORY QUESTIONS:
+1. Did the expected outcome happen? (yes/no/partially)
+2. What actually happened? (describe current screen state)
+3. Does the situation need correction? (yes/no)
 
-        Current Objective: {self.current_task.description}
-        Priority: {self.current_task.priority}
+IF ANSWER TO Q3 IS YES:
+→ Your FIRST action in "Next Actions" MUST be a corrective action
+→ Examples: 
+  - Close unwanted tab: send_key(["Control_L", "w"])
+  - Switch to correct tab: single_click on the tab element
+  - Dismiss popup: send_key(["Escape"])
+→ Do NOT proceed with original task until correction is done
 
-        Screen Analysis:
-        - [Windows]: [
-            [
-                "window_name": "exact name of the window",
-                "state": "active/minimized/maximized/hidden",
-                "coordinates": [100, 50, 800, 600],
-                "content": "detailed description of window content",
-                "interactive_elements": [
-                    "element_name at coordinates 150,75",
-                    "element_name at coordinates 200,100"
-                ],
-                "status": "ready/busy/error"
-            ]
-        ]
+'''
         
-        - [ALL UI Elements]: [
-            [
-                "element_name": "exact name of the element",
-                "type": "button/textfield/icon/link/file/folder/label/etc",
-                "coordinates": [50, 100, 200, 150],
-                "state": "enabled/disabled/selected/hovered",
-                "visibility": "fully_visible/partially_visible/hidden",
-                "interaction_method": "click/double_click/type/etc",
-                "text_content": "exact text content if any",
-                "file_properties": [
-                    "is_actual_file": "true/false",
-                    "file_extension": "file extension if applicable",
-                    "file_name": "complete file name if it's a file",
-                    "location_context": "desktop/file_manager/application_ui",
-                    "visual_file_indicator": "description of file icon or visual cues"
-                ],
-                "element_classification": [
-                    "element_category": "file/folder/ui_label/button/icon/window/etc",
-                    "confidence_level": "high/medium/low",
-                    "classification_reason": "why this element is classified this way",
-                    "task_relevance": "high/medium/low/none"
-                ],
-                "character_details": [
-                    [
-                        "char": "individual character",
-                        "position": "character position index",
-                        "coordinates": [55, 105, 65, 125],
-                        "font_size": "estimated font size",
-                        "confidence": "OCR confidence level"
-                    ]
-                ],
-                "word_details": [
-                    [
-                        "word": "complete word",
-                        "word_index": "word position index",
-                        "coordinates": [55, 105, 120, 125],
-                        "character_count": "number of characters"
-                    ]
-                ],
-                "cursor_info": [
-                    "position": "cursor position in text (character index)",
-                    "coordinates": [75, 110, 77, 130],
-                    "visible": "true/false",
-                    "blinking": "true/false"
-                ],
-                "selection_info": [
-                    "has_selection": "true/false",
-                    "start_position": "selection start character index",
-                    "end_position": "selection end character index",
-                    "selected_text": "text that is selected",
-                    "selection_coordinates": [60, 110, 150, 130]
-                ],
-                "focus_state": [
-                    "is_focused": "true/false",
-                    "focus_indicators": ["list of visual focus indicators"],
-                    "border_color": "border color if focused",
-                    "background_color": "background color"
-                ],
-                "field_properties": [
-                    "field_type": "input/textarea/password/rich_editor",
-                    "placeholder_text": "placeholder content if visible",
-                    "required": "true/false",
-                    "readonly": "true/false",
-                    "multiline": "true/false",
-                    "max_length": "maximum character limit if visible",
-                    "current_length": "current character count",
-                    "validation_state": "valid/invalid/error",
-                    "error_message": "error message if any",
-                    "auto_complete": "auto-complete suggestions if visible"
-                ]
-            ]
-        ]
-        
-        - [Files and Folders Detected]: [
-            [
-                "file_name": "exact file name with extension",
-                "file_type": "file/folder",
-                "coordinates": [250, 300, 350, 330],
-                "location": "desktop/file_manager/folder_path",
-                "file_extension": "extension if applicable",
-                "task_relevance": "mentioned_in_task/related/unrelated",
-                "visual_indicators": ["file icon", "extension visible", "file-like appearance"],
-                "accessibility": "can_double_click/read_only/locked"
-            ]
-        ]
-        
-        - [Result of last action]: {{
-            "success": true/false,
-            "details": "detailed description of what happened",
-            "problems": ["list of any issues encountered"],
-            "suggestions": ["list of potential solutions"],
-            "rollback_steps": ["steps to undo if needed"]
-        }}
-        
-        - [Screen Dimensions]: {{
-            "width": "exact width in pixels",
-            "height": "exact height in pixels",
-            "resolution": "screen resolution",
-            "scale_factor": "UI scaling factor if any"
-        }}
+        vision_prompt = f'''Analyze this screenshot to complete the task.
 
-        Task Status: {{
-            "status": "complete/not_complete/in_progress/error",
-            "completion_percentage": "estimated completion percentage",
-            "blockers": ["list of any blocking issues"],
-            "next_milestone": "next major step to complete"
-        }}
-        
-        Memory Storage: {{
-            "learned_patterns": ["patterns discovered during task execution"],
-            "successful_actions": ["actions that worked well"],
-            "failed_actions": ["actions that didn't work"],
-            "environment_state": "current state of the system",
-            "user_preferences": "any user-specific preferences discovered"
-        }}
+        TASK: {self.current_task.description}
+        PRIORITY: {self.current_task.priority}
+{last_action_validation}
+{mistakes_context}
 
-        Next Actions (list ALL required actions in order):
+        AVAILABLE UI ELEMENTS (from detector):
+        {coord_summary}
+
+        FULL ELEMENT DATA (JSON):
+        {compressed_coordinates}
+
+        ANALYSIS REQUIREMENTS:
+        
+        1. Active Window Analysis:
+           - What is currently focused/active
+           - List interactive elements with their exact coordinates
+           - Current state and what user is doing
+        
+        2. Desktop Context:
+           - Visible desktop icons (if relevant to task)
+           - Other windows (if task requires them)
+        
+        3. Element Details:
+           Format: "name (role) at center [x,y]"
+           - Only mention elements relevant to task
+           - Use exact coordinates from detector data
+           - Focus on interactive elements
+
+        4. Task Status:
+           - Is task complete? (yes/no/in_progress)
+           - What percentage complete?
+           - Any blockers?
+        
+        5. Outcome Validation (if last action info provided):
+           - outcome_validation: yes/no/partially (did expected outcome happen?)
+           - actual_outcome: describe what actually happened
+           - needs_correction: yes/no (does situation need fixing?)
+
+        CRITICAL RULE FOR NEXT ACTIONS:
+        - IF outcome_validation is "no" or "partially" AND needs_correction is "yes":
+          → The FIRST action MUST be a corrective action to fix the problem
+          → Examples: close unexpected tab/window, switch to correct tab, dismiss popup
+          → ONLY after correction, proceed with the original task
+        - IF outcome_validation is "yes":
+          → Continue with normal task actions
+
+        Next Actions (simplified format):
 
         1. Action: {{
-            "type": "single_click/double_click/right_click/type_text/send_key/wait/create_task/stop/move_mouse/create_employee/scroll_down/scroll_up",
+            "type": "single_click/double_click/type_text/send_key/scroll_up/scroll_down/wait/complete_task",
             "target": {{
-                "element_name": "exact name of target",
-                "coordinates": [400, 500, 550, 530],
-                "interaction_point": "475,515",
-                "character_position": "specific character index for cursor placement",
-                "word_position": "specific word index for interaction",
-                "text_content": "current text content of target",
-                "cursor_location": "current cursor position if applicable",
-                "element_type": "file/folder/button/textfield/icon/label/etc",
-                "file_validation": {{
-                    "is_actual_file": "true/false",
-                    "matches_task_requirement": "true/false",
-                    "file_extension_visible": "true/false",
-                    "location_appropriate": "true/false"
-                }}
+                "name": "element name from detector",
+                "role": "element role",
+                "center": [x, y],  // Use center from detector data
+                "app": "application name",
+                "window": "window title"
             }},
-            "detail": "precise description of the action",
-            "reason": "detailed explanation of why this action is needed",
-            "text_editing_details": {{
-                "edit_type": "insert/replace/append/delete/select",
-                "target_text": "text to insert or modify",
-                "cursor_placement": "before_char_X/after_char_X/at_word_X/start/end",
-                "selection_range": "start_char_X_to_char_Y",
-                "preserve_formatting": "true/false",
-                "validate_after": "true/false"
-            }},
-            "pre_actions": [
-                {{
-                    "type": "action type",
-                    "target": "target details",
-                    "reason": "why this pre-action is needed",
-                    "cursor_requirements": "cursor positioning needs",
-                    "focus_requirements": "focus state needs"
-                }}
-            ],
-            "post_actions": [
-                {{
-                    "type": "action type",
-                    "target": "target details",
-                    "reason": "why this post-action is needed",
-                    "validation_steps": "validation actions needed",
-                    "cursor_final_position": "where cursor should end up"
-                }}
-            ],
-            "thought": "detailed reasoning behind this action",
-            "expected_outcome": "what should happen after this action",
-            "fallback_plan": "what to do if this action fails",
-            "character_level_precision": {{
-                "required": "true/false",
-                "target_character_index": "specific character position",
-                "insertion_point": "600,650",
-                "selection_precision": "character-level selection details"
-            }}
+            "reason": "why this action",
+            "expected": "what should happen"
         }}
+        
+        Note: Choose action type carefully:
+        - double_click: for icons, files, folders, desktop items
+        - single_click: for buttons, menus, links, UI controls
+        - send_key: MUST use list format for keys (e.g., ["Control_L", "l"] not "Ctrl+L")
 
-        CRITICAL RULES:
-        1. ALWAYS maintain this exact format
-        2. List ALL required actions in proper sequence
-        3. Include ALL necessary pre/post actions
-        4. PRIORITIZE files mentioned in task context over generic UI text
-        5. VERIFY file authenticity before treating as file
-        6. For terminal interactions:
-           - Ensure terminal is focused first
-           - Include appropriate wait times
-           - Verify command execution
-        7. For system commands:
-           - Check for errors in response
-           - Verify command success
-        8. Be specific about targets and reasons
-        9. For open apps and files you MUST use double_click instead of single_click
-        10. For errors and something like them you can use create_task to create new task with higher priority
-        11. If a task with higher priority is created via create_task:
-            - Immediately terminate the current task's action list
-            - Only output the new task (no other actions or tasks)
-            - Do NOT add subsequent actions to the original task
-        12. When describing coordinates or locations, provide all four corner points (top-left, top-right, bottom-right, bottom-left)
-        13. Include ALL details in screen analysis (press enter, clicks, etc.)
-        14. Consider system state changes (windows closed, OS shutdown, etc.)
-        15. Report ALL command line content in window details
-        16. Actions must be explicit and deterministic—no conditionals
-        17. For opening apps, use application menu, desktop, or terminal
-        18. Review Recent Actions before executing any UI or system changes
-        19. For downloading big files, check ftp://ftp-server:20 (username: myuser, password: mypassword)
-        20. Monitor http://rocketchat:3000 for messages (username: {username}, password: mypassword)
-        21. Include single_click in pre-actions when cursor position is critical
-        22. Verify element visibility and accessibility before interaction
-        23. Consider element hierarchy and relationships
-        24. Account for UI scaling and resolution
-        25. Verify action success before proceeding
-        26. Include error handling and recovery steps
-        27. Consider system performance and response times
-        28. ALWAYS report mouse position separately
-        29. DO NOT confuse mouse cursor with other UI elements
-        30. Verify element types before reporting
-        31. Use exact coordinates for all elements
-        32. Double-check element names and types
-        33. You SHOULD use scroll that page when we need to see the other part of the page
-        34. CHARACTER-LEVEL TEXT EDITING RULES:
-            - When editing text, use exact character positions from coordinate data
-            - For inserting text at specific positions, reference character indices
-            - For selecting text, use start and end character positions
-            - For cursor placement, specify exact character location
-            - Always report current text content and cursor position
-            - Use word boundaries for more efficient text operations
-            - Consider text field validation states before editing
-            - Preserve existing formatting when possible
-            - Report character-level changes in action results
-        35. PRECISION REQUIREMENTS:
-            - Always use character-level coordinates for text editing
-            - Report exact cursor position after each text operation
-            - Validate text content after modifications
-            - Use word-level operations when character-level is not needed
-            - Consider multi-byte characters and unicode support
-            - Handle text selection ranges with character precision
-            - Account for text field boundaries and limits
-        36. TEXT FIELD STATE MANAGEMENT:
-            - Always check focus state before text operations
-            - Verify cursor visibility and position
-            - Handle text selection states appropriately
-            - Consider readonly and disabled field states
-            - Respect field validation requirements
-            - Monitor text length limits and restrictions
-        37. FILE DETECTION VALIDATION:
-            - Verify that identified files have appropriate visual file indicators
-            - Confirm file names match task requirements before targeting
-            - Distinguish between file icons and UI text elements
-            - Check file location context (desktop vs application UI)
-            - Validate file extensions are visible or implied by icon type
+        KEY RULES (simplified):
+        1. Use EXACT coordinates from detector data above
+        2. For clicks: use "center" point from element data
+        3. Focus on active window first
+        4. Desktop icons: look in caja "Desktop" window
+        5. Only interact with interactive elements (i:true)
+        6. For text input: click element first, then type
+        7. Use scroll when needed to see more content
+        8. Check FTP (ftp://ftp-server:20) for files if needed
+        9. Check RocketChat messenger (http://rocketchat:3000) - IMPORTANT: RocketChat is a web-based messenger, you MUST use Firefox browser to access it
+        10. Username: {username}, Password: mypassword (for both)
+        11. KEYBOARD SHORTCUTS: Always use list format:
+            - Ctrl+L (address bar): ["Control_L", "l"]
+            - Ctrl+T (new tab): ["Control_L", "t"]
+            - Ctrl+W (close tab): ["Control_L", "w"]
+            - Alt+Tab (switch window): ["Alt_L", "Tab"]
+            - Enter key: ["Return"]
+        12. CORRECTIVE ACTIONS (Critical - Execute IMMEDIATELY if something went wrong):
+            BROWSER-SPECIFIC CORRECTIONS:
+            - Unexpected tab/window opened (e.g., Password Manager, New Tab):
+              → send_key(["Control_L", "w"]) to close current unwanted tab
+              → Then click on the correct tab to return to original page
+            - Wrong page loaded in current tab:
+              → Click on correct browser tab to switch back
+              → OR use send_key(["Alt_L", "Left"]) to go back in history
+            - Browser popup/autocomplete appeared:
+              → send_key(["Escape"]) to dismiss popup
+            - Multiple unwanted tabs opened:
+              → Repeatedly use send_key(["Control_L", "w"]) until back to correct tab
+            
+            GENERAL CORRECTIONS:
+            - Action had no effect: Try alternative element or method
+            - Element not found: Scroll to find it, or use keyboard navigation
+            - Dialog/modal blocking: Press Escape or click close button
+            
+            IMPORTANT: Corrective actions take priority over task continuation!
+            Always learn from mistakes listed above and avoid repeating them
+        
+        IMPORTANT CLICK RULES:
+        - DOUBLE_CLICK: Use for opening icons, files, folders, applications (role: icon, label with file/app names)
+        - SINGLE_CLICK: Use for buttons, menu items, links, tabs, text fields (role: button, menu item, link, tab, text, entry)
+        - Examples: 
+          * Desktop icons → double_click
+          * File manager files/folders → double_click
+          * Application icons → double_click
+          * Buttons/Menu items → single_click
 
-        Current task objective: {self.current_task.description}
-        Priority: {self.current_task.priority}
-        Coordinates of the picture: {json.dumps(clean_coordinates, indent=2, ensure_ascii=False)}
+        DESKTOP CONTEXT:
+        - mate-panel: Top/bottom panels (system only, rarely clickable)
+        - caja Desktop: Desktop icons (interactive)
+        - caja root: File browser window
         '''
         logService.append_log(self.step_id, self.current_task.id, enhanced_prompt + vision_prompt, 'vision_request',
                               DataService().get_user_path_screenshot(self.user_id))
@@ -681,215 +587,128 @@ class ProcessorService:
             'user_id': self.user_id,
             'response': response,
         })
+        
+        # پردازش outcome validation و ذخیره mistake در صورت لزوم
+        self._process_outcome_validation(response)
+        
+        # Desktop visualization disabled (using detector coordinates instead)
+        # Visualization is already done by draw_rectangles_on_image above
+        
         return response
 
-    def process_position_request(self, user_id: int, screenshot_path: str, output_path: str = None) -> dict:
-        localCoordinates = self.getCoordinatesInLocal()
-        
-        # اضافه کردن task context برای کمک به تشخیص بهتر
-        task_context = ""
-        if self.current_task:
-            task_context = f"\nTASK CONTEXT: {self.current_task.description}"
-        
-        positionTextRequest = f'''CRITICAL: Return ONLY valid JSON. No text before or after.
-
-        Task: {task_context if task_context else "General UI detection"}
-
-        MANDATORY REQUIREMENT - PRESERVE ALL ELEMENTS:
-        You MUST output EXACTLY one element for each main input element. Count verification required.
-        Input main elements: Elements WITHOUT these suffixes: _char_, _word_, _full_text, _text_content, _char_count, _word_count
-        
-        STRICT PROCESSING STEPS:
-        1. SCAN all input elements
-        2. IDENTIFY main elements (exclude breakdown details)
-        3. FOR EACH main element, create exactly ONE output element with better name
-        4. NEVER skip any main element
-        5. NEVER add elements not in input
-
-        ELEMENT FILTERING RULES:
-        KEEP: "desktop", "web_browser_0", "terminal_1", "text_element_2", "desktop_icon_3", "file_manager_button_4", "start_menu_5", "button_6", "button_8", "desktops_button_9", "desktop_icon_10", "button_11", "text_element_12", "text_element_13", "clock_14", "ui_text_15", "desktop_icon_16", "firefox_minized_app_17"
-        
-        REMOVE: Any element with these suffixes: "_char_0_", "_word_0_", "_full_text", "_text_content", "_char_count", "_word_count"
-
-        SMART NAME MAPPING:
-        - "text_element_12" + text_content="test.txt" → "test_txt_file"
-        - "text_element_13" → "text_label_13"  
-        - "desktop_icon_3" → "firefox_icon"
-        - "desktop_icon_7" → "terminal_icon"
-        - "desktop_icon_10" → "folder_icon"
-        - "desktop_icon_16" → "terminal_app_icon"
-        - "web_browser_0" → "browser_window"
-        - "terminal_1" → "terminal_window" 
-        - "start_menu_5" → "start_menu_button"
-        - "clock_14" → "system_clock"
-        - "button_6" → "ui_button_6"
-        - "button_8" → "ui_button_8"
-        - "button_11" → "ui_button_11"
-        - "file_manager_button_4" → "file_manager_button"
-        - "desktops_button_9" → "desktops_button"
-        - "ui_text_15" → "ui_text_label"
-        - "firefox_minized_app_17" → "firefox_minimized_app"
-
-        VERIFICATION CHECKLIST:
-        ✓ Desktop element first
-        ✓ Count main input elements vs output elements (must match)
-        ✓ All element names improved but coordinates preserved
-        ✓ No duplicate names in output
-        ✓ JSON valid and parseable
-
-        INPUT YOLO DATA:
-        ''' + localCoordinates + '''
-
-        OUTPUT: Clean JSON with ALL main elements, better names, original coordinates:'''
-
-        path_local_coordinates = DataService().get_user_path_screenshot_with_coordinates(self.user_id, self.step_id)
-        details = self.draw_rectangles_on_image(
-            screenshot_path,
-            json.loads(localCoordinates),
-            path_local_coordinates
-        )
-        real_width, real_height = self.get_image_dimensions(screenshot_path)
-        if details != {}:
-            logService.append_log(self.step_id, self.current_task.id,
-                                  f'real_width: {real_width}, real_height: {real_height}, detail: {details}',
-                                  'local_coordinates',
-                                  path_local_coordinates)
-        logService.append_log(self.step_id, self.current_task.id, positionTextRequest, 'position_request',
-                              DataService().get_user_path_screenshot(self.user_id))
-        
-        self.websocket_manager.send_to_user_with_format(self.system_user.id, WebSocketType.POSITION_REQUEST, {
-            'user_id': self.user_id,
-            'request': positionTextRequest,
-        })
-        
-        coordinates_string = position_model.call(positionTextRequest, screenshot_path)
-        
-        # فرمت کردن JSON برای نمایش بهتر در لاگ
-        try:
-            parsed_coordinates = json.loads(coordinates_string)
-            formatted_coordinates_string = json.dumps(parsed_coordinates, indent=2, ensure_ascii=False)
-        except json.JSONDecodeError:
-            formatted_coordinates_string = coordinates_string
-        
-        logService.append_log(self.step_id, self.current_task.id, formatted_coordinates_string, 'position_response', None)
-        
-        self.websocket_manager.send_to_user_with_format(self.system_user.id, WebSocketType.POSITION_RESPONSE, {
-            'user_id': self.user_id,
-            'response': coordinates_string,
-        })
-        coordinates = json.loads(coordinates_string)
-
-        # رسم مستطیل‌ها روی عکس
-        if output_path:
-            details = self.draw_rectangles_on_image(
-                screenshot_path,
-                coordinates,
-                output_path
-            )
-            real_width, real_height = self.get_image_dimensions(screenshot_path)
-            if details != {}:
-                logService.append_log(self.step_id, self.current_task.id,
-                                      f'real_width: {real_width}, real_height: {real_height}, detail: {details}',
-                                      'coordinates',
-                                      output_path)
-
-        return coordinates
-
     def getCoordinatesInLocal(self):
-        from ultralytics import YOLO
+        import sys
         import os
-        
+
+        # اضافه کردن مسیر sam.py
+        sam_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "sam.py")
+        sys.path.append(os.path.dirname(sam_path))
+
+        try:
+            from sam import load_sam_model, load_image, segment_image
+        except ImportError:
+            # fallback به YOLO اگر SAM در دسترس نباشد
+            return self._fallback_to_yolo()
+
         img_path = DataService().get_user_path_screenshot(self.user_id)
-        
-        # بارگذاری مدل YOLO کوچک‌تر
-        model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "best.pt")
-        if not os.path.exists(model_path):
-            # اگر مدل سفارشی وجود نداشت، از مدل پیش‌فرض استفاده کن
-            model_path = "yolov8n.pt"
-        
-        model = YOLO(model_path)
-        
-        # تنظیمات بهینه برای کاهش مصرف حافظه
-        model.overrides['conf'] = 0.3  # افزایش آستانه اطمینان
-        model.overrides['iou'] = 0.5   # تنظیم IoU
-        model.overrides['max_det'] = 50  # کاهش تعداد تشخیص‌ها
-        
-        # انجام پیش‌بینی روی تصویر
-        results = model(img_path)
-        
-        # خواندن ابعاد تصویر
-        image = cv2.imread(img_path)
-        coordinates = {"desktop": [0, 0, image.shape[1], image.shape[0]]}
-        
-        # اضافه کردن OCR کلی برای یافتن فایل‌های احتمالی
-        ocr_detected_files = self.detect_files_with_ocr(image)
-        
-        # پردازش نتایج YOLO
-        for result in results:
-            if result.boxes is not None:
-                for i, box in enumerate(result.boxes):
-                    class_id = int(box.cls)
-                    class_name = model.names[class_id] if class_id in model.names else f"class_{class_id}"
-                    coords = box.xyxy[0].tolist()  # مختصات [x1, y1, x2, y2]
-                    confidence = box.conf.item()
-                    
-                    # فقط المان‌هایی با اطمینان بالا را در نظر بگیریم
-                    if confidence > 0.3:
-                        # بررسی اینکه آیا این المان فایل است یا UI text
-                        element_name = self.classify_element_type(
-                            image, 
-                            [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])],
-                            class_name, 
-                            i,
+
+        try:
+            # بارگذاری مدل SAM
+            sam_model = load_sam_model()
+
+            # بارگذاری و پردازش تصویر
+            image = load_image(img_path)
+            original_image = cv2.imread(img_path)
+
+            # انجام segmentation
+            masks = segment_image(image, sam_model)
+
+            # ساخت coordinates با polygon format
+            coordinates = {
+                "desktop": [[0, 0], [original_image.shape[1], 0], [original_image.shape[1], original_image.shape[0]],
+                            [0, original_image.shape[0]]]}
+
+            # اضافه کردن OCR برای یافتن فایل‌های احتمالی
+            ocr_detected_files = self.detect_files_with_ocr(original_image)
+
+            # پردازش masks و تبدیل به polygon coordinates
+            for i, mask in enumerate(masks):
+                try:
+                    # دریافت polygon از mask
+                    polygon_coords = self.mask_to_polygon(mask['segmentation'])
+
+                    if polygon_coords and len(polygon_coords) >= 3:  # حداقل 3 نقطه برای polygon معتبر
+                        # طبقه‌بندی المان
+                        bbox = mask['bbox']
+                        element_name = self.classify_sam_element(
+                            original_image,
+                            polygon_coords,
+                            bbox,
+                            f"segment_{i}",
                             ocr_detected_files
                         )
-                        
-                        coordinates[element_name] = [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])]
-                        
-                        # تجزیه تفصیلی برای text field ها و المان‌های متنی
-                        if any(keyword in class_name.lower() for keyword in ['text', 'input', 'field', 'label', 'button']):
-                            detailed_coords = self.analyze_element_detailed(
-                                image, 
-                                [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])],
+
+                        coordinates[element_name] = polygon_coords
+
+                        # تجزیه تفصیلی برای المان‌های متنی
+                        if self.is_text_element(element_name, polygon_coords, original_image):
+                            detailed_coords = self.analyze_polygon_element_detailed(
+                                original_image,
+                                polygon_coords,
                                 element_name
                             )
                             coordinates.update(detailed_coords)
-        
-        # اضافه کردن فایل‌های شناسایی شده با OCR که توسط YOLO یافت نشده‌اند
-        for file_info in ocr_detected_files:
-            file_name = file_info['name']
-            file_coords = file_info['coords']
-            
-            # بررسی اینکه آیا این فایل قبلاً توسط YOLO شناسایی شده یا نه
-            overlap_found = False
-            for existing_coords in coordinates.values():
-                if self.check_overlap(file_coords, existing_coords, threshold=0.5):
-                    overlap_found = True
-                    break
-            
-            if not overlap_found:
-                coordinates[file_name] = file_coords
-        
-        return json.dumps(coordinates)
+
+                except Exception as e:
+                    print(f"Error processing mask {i}: {e}")
+                    continue
+
+            # اضافه کردن فایل‌های OCR که overlap ندارند
+            for file_info in ocr_detected_files:
+                file_name = file_info['name']
+                file_bbox = file_info['coords']  # [x1, y1, x2, y2]
+
+                # تبدیل bbox به polygon
+                file_polygon = [[file_bbox[0], file_bbox[1]], [file_bbox[2], file_bbox[1]],
+                                [file_bbox[2], file_bbox[3]], [file_bbox[0], file_bbox[3]]]
+
+                # بررسی overlap با polygons موجود
+                overlap_found = False
+                for existing_coords in coordinates.values():
+                    if isinstance(existing_coords, list) and len(existing_coords) > 0 and isinstance(existing_coords[0],
+                                                                                                     list):
+                        if self.check_polygon_overlap(file_polygon, existing_coords, threshold=0.5):
+                            overlap_found = True
+                            break
+
+                if not overlap_found:
+                    coordinates[file_name] = file_polygon
+
+            return json.dumps(coordinates, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"Error in SAM processing: {e}")
+            # fallback به YOLO در صورت خطا
+            return self._fallback_to_yolo()
 
     def detect_files_with_ocr(self, image):
         """
         استفاده از OCR برای یافتن فایل‌های احتمالی در تصویر
         """
         detected_files = []
-        
+
         try:
             # تبدیل به تصویر خاکستری
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            
+
             # استخراج متن با OCR
             data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config='--psm 6')
-            
+
             # یافتن کلمات که احتمال دارد نام فایل باشند
             for i in range(len(data['text'])):
                 text = data['text'][i].strip()
                 confidence = int(data['conf'][i])
-                
+
                 if confidence > 50 and text:
                     # بررسی اینکه آیا متن شبیه نام فایل است
                     if self.looks_like_filename(text):
@@ -897,14 +716,14 @@ class ProcessorService:
                         y = data['top'][i]
                         w = data['width'][i]
                         h = data['height'][i]
-                        
+
                         # اضافه کردن padding برای در نظر گیری icon فایل
                         padding = 20
                         x1 = max(0, x - padding)
                         y1 = max(0, y - padding)
                         x2 = min(image.shape[1], x + w + padding)
                         y2 = min(image.shape[0], y + h + padding)
-                        
+
                         file_name = self.generate_file_element_name(text)
                         detected_files.append({
                             'name': file_name,
@@ -912,10 +731,10 @@ class ProcessorService:
                             'original_text': text,
                             'confidence': confidence
                         })
-        
+
         except Exception as e:
             print(f"OCR file detection error: {e}")
-        
+
         return detected_files
 
     def looks_like_filename(self, text):
@@ -928,17 +747,17 @@ class ProcessorService:
             r'^[a-zA-Z0-9_\-\.]+\.(txt|pdf|doc|docx|jpg|jpeg|png|gif|exe|zip|rar|mp3|mp4|avi)$',  # نام فایل کامل
             r'^test\.txt$',  # فایل خاص که در task ذکر شده
         ]
-        
+
         # بررسی task context برای نام‌های خاص
         if self.current_task and 'test.txt' in self.current_task.description.lower():
             if 'test.txt' in text.lower() or 'test' in text.lower():
                 return True
-        
+
         import re
         for pattern in file_patterns:
             if re.match(pattern, text, re.IGNORECASE):
                 return True
-        
+
         return False
 
     def generate_file_element_name(self, filename):
@@ -959,12 +778,12 @@ class ProcessorService:
         """
         x1, y1, x2, y2 = coords
         element_image = image[y1:y2, x1:x2]
-        
+
         # بررسی اینکه آیا این المان با فایل‌های OCR مطابقت دارد
         for file_info in ocr_files:
             if self.check_overlap(coords, file_info['coords'], threshold=0.3):
                 return file_info['name']
-        
+
         # طبقه‌بندی بر اساس class name و محل قرارگیری
         if class_name.lower() in ['file', 'document', 'text_file']:
             return f"unknown_file_{index}"
@@ -988,7 +807,7 @@ class ProcessorService:
         """
         x1, y1, x2, y2 = coords
         height, width = image_shape[:2]
-        
+
         # اگر المان در نیمه بالایی صفحه و نه در نوار پایینی باشد
         if y1 < height * 0.7 and y2 < height * 0.9:
             return True
@@ -1000,15 +819,15 @@ class ProcessorService:
         """
         x1, y1, x2, y2 = coords
         height, width = image_shape[:2]
-        
+
         # نوار پایینی (taskbar)
         if y1 > height * 0.9:
             return True
-        
+
         # گوشه‌های صفحه (status areas)
         if (x1 < width * 0.1 and y1 < height * 0.1) or (x1 > width * 0.9 and y1 < height * 0.1):
             return True
-        
+
         return False
 
     def check_overlap(self, coords1, coords2, threshold=0.5):
@@ -1017,62 +836,269 @@ class ProcessorService:
         """
         x1_1, y1_1, x2_1, y2_1 = coords1
         x1_2, y1_2, x2_2, y2_2 = coords2
-        
+
         # محاسبه ناحیه overlap
         overlap_x1 = max(x1_1, x1_2)
         overlap_y1 = max(y1_1, y1_2)
         overlap_x2 = min(x2_1, x2_2)
         overlap_y2 = min(y2_1, y2_2)
-        
+
         if overlap_x1 >= overlap_x2 or overlap_y1 >= overlap_y2:
             return False
-        
+
         overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
         area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
         area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-        
+
         overlap_ratio = overlap_area / min(area1, area2)
         return overlap_ratio >= threshold
+
+    def mask_to_polygon(self, mask):
+        """
+        تبدیل SAM mask به polygon coordinates
+        """
+        try:
+            import cv2
+            import numpy as np
+
+            # تبدیل mask به uint8
+            mask_uint8 = (mask * 255).astype(np.uint8)
+
+            # پیدا کردن contours
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours:
+                return None
+
+            # انتخاب بزرگترین contour
+            largest_contour = max(contours, key=cv2.contourArea)
+
+            # ساده‌سازی polygon (کاهش تعداد نقاط)
+            epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+            simplified_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
+
+            # تبدیل به فرمت [[x, y], [x, y], ...]
+            polygon_points = []
+            for point in simplified_contour:
+                x, y = point[0]
+                polygon_points.append([int(x), int(y)])
+
+            return polygon_points
+
+        except Exception as e:
+            print(f"Error converting mask to polygon: {e}")
+            return None
+
+    def classify_sam_element(self, image, polygon_coords, bbox, default_name, ocr_files):
+        """
+        طبقه‌بندی المان‌های SAM
+        """
+        try:
+            # محاسبه bounding box از polygon
+            if not polygon_coords:
+                return default_name
+
+            # بررسی تطابق با فایل‌های OCR
+            polygon_bbox = self.polygon_to_bbox(polygon_coords)
+            for file_info in ocr_files:
+                if self.check_overlap(polygon_bbox, file_info['coords'], threshold=0.3):
+                    return file_info['name']
+
+            # طبقه‌بندی بر اساس ویژگی‌های geometric
+            area = self.polygon_area(polygon_coords)
+            aspect_ratio = self.polygon_aspect_ratio(polygon_coords)
+
+            if area < 500:
+                return f"small_element_{default_name}"
+            elif area > 50000:
+                return f"large_element_{default_name}"
+            elif aspect_ratio > 3:
+                return f"text_element_{default_name}"
+            elif aspect_ratio < 0.5:
+                return f"button_element_{default_name}"
+            else:
+                return f"ui_element_{default_name}"
+
+        except Exception as e:
+            return default_name
+
+    def is_text_element(self, element_name, polygon_coords, image):
+        """
+        تشخیص اینکه آیا المان متنی است
+        """
+        if any(keyword in element_name.lower() for keyword in ['text', 'input', 'field', 'label', 'button']):
+            return True
+
+        # بررسی aspect ratio
+        aspect_ratio = self.polygon_aspect_ratio(polygon_coords)
+        return aspect_ratio > 2.5  # المان‌های بلند و باریک احتمالاً متن هستند
+
+    def analyze_polygon_element_detailed(self, image, polygon_coords, element_name):
+        """
+        تجزیه تفصیلی المان‌های polygon
+        """
+        detailed_coords = {}
+
+        try:
+            # تبدیل polygon به bbox برای OCR
+            bbox = self.polygon_to_bbox(polygon_coords)
+
+            # استفاده از تابع موجود با bbox
+            bbox_detailed = self.analyze_element_detailed(image, bbox, element_name)
+
+            # تبدیل نتایج bbox به polygon format در صورت نیاز
+            detailed_coords.update(bbox_detailed)
+
+        except Exception as e:
+            print(f"Error analyzing polygon element {element_name}: {e}")
+
+        return detailed_coords
+
+    def check_polygon_overlap(self, poly1, poly2, threshold=0.5):
+        """
+        بررسی overlap بین دو polygon
+        """
+        try:
+            # تبدیل به bbox برای محاسبه ساده
+            bbox1 = self.polygon_to_bbox(poly1)
+            bbox2 = self.polygon_to_bbox(poly2)
+
+            return self.check_overlap(bbox1, bbox2, threshold)
+
+        except Exception as e:
+            return False
+
+    def polygon_to_bbox(self, polygon_coords):
+        """
+        تبدیل polygon به bounding box [x1, y1, x2, y2]
+        """
+        if not polygon_coords:
+            return [0, 0, 0, 0]
+
+        x_coords = [point[0] for point in polygon_coords]
+        y_coords = [point[1] for point in polygon_coords]
+
+        return [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
+
+    def polygon_area(self, polygon_coords):
+        """
+        محاسبه مساحت polygon
+        """
+        if len(polygon_coords) < 3:
+            return 0
+
+        area = 0
+        n = len(polygon_coords)
+        for i in range(n):
+            j = (i + 1) % n
+            area += polygon_coords[i][0] * polygon_coords[j][1]
+            area -= polygon_coords[j][0] * polygon_coords[i][1]
+
+        return abs(area) / 2
+
+    def polygon_aspect_ratio(self, polygon_coords):
+        """
+        محاسبه aspect ratio polygon
+        """
+        bbox = self.polygon_to_bbox(polygon_coords)
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+
+        if height == 0:
+            return float('inf')
+
+        return width / height
+
+    def _fallback_to_yolo(self):
+        """
+        Fallback به YOLO در صورت عدم دسترسی به SAM
+        """
+        try:
+            from ultralytics import YOLO
+            import os
+
+            img_path = DataService().get_user_path_screenshot(self.user_id)
+
+            # بارگذاری مدل YOLO
+            model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                                      "best.pt")
+            if not os.path.exists(model_path):
+                model_path = "yolov8n.pt"
+
+            model = YOLO(model_path)
+            model.overrides['conf'] = 0.3
+            model.overrides['iou'] = 0.5
+            model.overrides['max_det'] = 50
+
+            results = model(img_path)
+            image = cv2.imread(img_path)
+
+            # تبدیل نتایج YOLO به polygon format
+            coordinates = {
+                "desktop": [[0, 0], [image.shape[1], 0], [image.shape[1], image.shape[0]], [0, image.shape[0]]]}
+
+            for result in results:
+                if result.boxes is not None:
+                    for i, box in enumerate(result.boxes):
+                        class_id = int(box.cls)
+                        class_name = model.names[class_id] if class_id in model.names else f"class_{class_id}"
+                        coords = box.xyxy[0].tolist()
+                        confidence = box.conf.item()
+
+                        if confidence > 0.3:
+                            # تبدیل bbox به polygon
+                            x1, y1, x2, y2 = [int(c) for c in coords]
+                            polygon = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+
+                            element_name = f"yolo_{class_name}_{i}"
+                            coordinates[element_name] = polygon
+
+            return json.dumps(coordinates, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"YOLO fallback failed: {e}")
+            # حداقل desktop را برگردان
+            return json.dumps({"desktop": [[0, 0], [1920, 0], [1920, 1080], [0, 1080]]}, ensure_ascii=False)
 
     def analyze_element_detailed(self, image, coords, element_name):
         """
         تجزیه تفصیلی یک المان برای استخراج کاراکترها و محتویات
         """
         detailed_coords = {}
-        
+
         try:
             # برش المان از تصویر
             x1, y1, x2, y2 = coords
             element_image = image[y1:y2, x1:x2]
-            
+
             if element_image.size == 0:
                 return detailed_coords
-            
+
             # تبدیل به تصویر خاکستری
             gray = cv2.cvtColor(element_image, cv2.COLOR_BGR2GRAY)
-            
+
             # preprocessing برای بهبود OCR
             # افزایش کنتراست
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(gray)
-            
+
             # حذف نویز
             denoised = cv2.medianBlur(enhanced, 3)
-            
+
             # threshold برای تشخیص بهتر متن
             _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
+
             # تشخیص متن با جزئیات
             try:
                 # استخراج اطلاعات کاراکتر به کاراکتر
                 data = pytesseract.image_to_data(thresh, output_type=pytesseract.Output.DICT, config='--psm 6')
-                
+
                 # تجمیع اطلاعات کاراکترها
                 characters = []
                 words = []
                 current_word = ""
                 current_word_coords = []
-                
+
                 for i in range(len(data['text'])):
                     if int(data['conf'][i]) > 30:  # فقط کاراکترهای با اطمینان بالا
                         char_text = data['text'][i].strip()
@@ -1082,13 +1108,13 @@ class ProcessorService:
                             char_y = data['top'][i]
                             char_w = data['width'][i]
                             char_h = data['height'][i]
-                            
+
                             # مختصات مطلق کاراکتر
                             abs_char_x1 = x1 + char_x
                             abs_char_y1 = y1 + char_y
                             abs_char_x2 = abs_char_x1 + char_w
                             abs_char_y2 = abs_char_y1 + char_h
-                            
+
                             # اضافه کردن کاراکتر
                             char_info = {
                                 'text': char_text,
@@ -1098,13 +1124,13 @@ class ProcessorService:
                                 'relative_position': len(characters)
                             }
                             characters.append(char_info)
-                            
+
                             # ساخت کلید برای کاراکتر
-                            char_key = f"{element_name}_char_{len(characters)-1}_{char_text}"
+                            char_key = f"{element_name}_char_{len(characters) - 1}_{char_text}"
                             detailed_coords[char_key] = [abs_char_x1, abs_char_y1, abs_char_x2, abs_char_y2]
-                            
+
                             # جمع‌آوری کلمات
-                            if data['word_num'][i] == data['word_num'][i-1] if i > 0 else True:
+                            if data['word_num'][i] == data['word_num'][i - 1] if i > 0 else True:
                                 current_word += char_text
                                 current_word_coords.extend([abs_char_x1, abs_char_y1, abs_char_x2, abs_char_y2])
                             else:
@@ -1117,10 +1143,10 @@ class ProcessorService:
                                     word_y2 = max(current_word_coords[3::4])
                                     detailed_coords[word_key] = [word_x1, word_y1, word_x2, word_y2]
                                     words.append(current_word)
-                                
+
                                 current_word = char_text
                                 current_word_coords = [abs_char_x1, abs_char_y1, abs_char_x2, abs_char_y2]
-                
+
                 # اضافه کردن آخرین کلمه
                 if current_word:
                     word_key = f"{element_name}_word_{len(words)}_{current_word}"
@@ -1129,7 +1155,7 @@ class ProcessorService:
                     word_x2 = max(current_word_coords[2::4])
                     word_y2 = max(current_word_coords[3::4])
                     detailed_coords[word_key] = [word_x1, word_y1, word_x2, word_y2]
-                
+
                 # اضافه کردن اطلاعات کلی المان
                 full_text = ' '.join([char['text'] for char in characters])
                 if full_text.strip():
@@ -1137,18 +1163,18 @@ class ProcessorService:
                     detailed_coords[f"{element_name}_text_content"] = full_text.strip()
                     detailed_coords[f"{element_name}_char_count"] = len(characters)
                     detailed_coords[f"{element_name}_word_count"] = len(words)
-                
+
                 # تشخیص cursor (اگر المان فعال باشد)
-                cursor_pos = self.detect_cursor_position(element_image, characters)
+                cursor_pos = self.detect_cursor_position(element_image, characters, x1, y1)
                 if cursor_pos:
                     cursor_key = f"{element_name}_cursor"
                     detailed_coords[cursor_key] = [
-                        x1 + cursor_pos[0], 
-                        y1 + cursor_pos[1], 
-                        x1 + cursor_pos[0] + 2, 
+                        x1 + cursor_pos[0],
+                        y1 + cursor_pos[1],
+                        x1 + cursor_pos[0] + 2,
                         y1 + cursor_pos[1] + cursor_pos[3]
                     ]
-                
+
             except Exception as e:
                 # در صورت خطا در OCR، حداقل متن کلی را استخراج کن
                 try:
@@ -1157,42 +1183,42 @@ class ProcessorService:
                         detailed_coords[f"{element_name}_text_content"] = text
                 except:
                     pass
-            
+
         except Exception as e:
             print(f"Error analyzing element {element_name}: {e}")
-        
+
         return detailed_coords
 
-    def detect_cursor_position(self, element_image, characters):
+    def detect_cursor_position(self, element_image, characters, element_x1=0, element_y1=0):
         """
         تشخیص موقعیت cursor در یک المان متنی
         """
         try:
             # تبدیل به تصویر خاکستری
             gray = cv2.cvtColor(element_image, cv2.COLOR_BGR2GRAY)
-            
+
             # تشخیص خطوط عمودی (cursor معمولاً یک خط عمودی است)
             # استفاده از kernel عمودی برای تشخیص خطوط عمودی
             vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 10))
             vertical_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, vertical_kernel)
-            
+
             # پیدا کردن contour ها
             contours, _ = cv2.findContours(vertical_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
+
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
                 # cursor معمولاً یک خط باریک و بلند است
                 if w <= 3 and h >= 10:  # cursor criteria
                     return [x, y, w, h]
-            
+
             # اگر cursor مستقیماً یافت نشد، موقعیت احتمالی بعد از آخرین کاراکتر
             if characters:
                 last_char = characters[-1]
-                return [last_char['coordinates'][2] - x1, last_char['coordinates'][1] - y1, 2, last_char['font_size']]
-            
+                return [last_char['coordinates'][2] - element_x1, last_char['coordinates'][1] - element_y1, 2, last_char['font_size']]
+
         except Exception as e:
             print(f"Error detecting cursor: {e}")
-        
+
         return None
 
     def analyze_text_field_state(self, element_coords, element_name):
@@ -1202,10 +1228,10 @@ class ProcessorService:
         try:
             img_path = DataService().get_user_path_screenshot(self.user_id)
             image = cv2.imread(img_path)
-            
+
             x1, y1, x2, y2 = element_coords
             field_image = image[y1:y2, x1:x2]
-            
+
             state_info = {
                 'element_name': element_name,
                 'coordinates': element_coords,
@@ -1217,20 +1243,20 @@ class ProcessorService:
                 'word_positions': [],
                 'field_type': 'unknown'
             }
-            
+
             # تشخیص focus (معمولاً با border رنگی یا highlight)
             state_info['is_focused'] = self.detect_focus_state(field_image)
-            
+
             # تشخیص selection (معمولاً با background رنگی)
             selection_info = self.detect_text_selection(field_image)
             state_info['has_selection'] = selection_info['has_selection']
             state_info['selection_range'] = selection_info.get('range', None)
-            
+
             # تشخیص نوع فیلد
             state_info['field_type'] = self.detect_field_type(field_image)
-            
+
             return state_info
-            
+
         except Exception as e:
             print(f"Error analyzing text field state: {e}")
             return None
@@ -1242,29 +1268,29 @@ class ProcessorService:
         try:
             # تبدیل به HSV برای تشخیص بهتر رنگ‌ها
             hsv = cv2.cvtColor(field_image, cv2.COLOR_BGR2HSV)
-            
+
             # تشخیص border های رنگی (معمولاً آبی برای focus)
             # محدوده رنگ آبی
             lower_blue = np.array([100, 50, 50])
             upper_blue = np.array([130, 255, 255])
             blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-            
+
             # اگر مقدار قابل توجهی از border آبی یافت شد
             blue_pixels = cv2.countNonZero(blue_mask)
             total_pixels = field_image.shape[0] * field_image.shape[1]
-            
+
             if blue_pixels > total_pixels * 0.02:  # 2% از pixels آبی باشند
                 return True
-            
+
             # تشخیص سایر نشانه‌های focus
             gray = cv2.cvtColor(field_image, cv2.COLOR_BGR2GRAY)
             edges = cv2.Canny(gray, 50, 150)
-            
+
             # اگر edge های زیادی در حاشیه وجود دارد، احتمالاً focused است
             border_edges = np.sum(edges[0, :]) + np.sum(edges[-1, :]) + np.sum(edges[:, 0]) + np.sum(edges[:, -1])
-            
+
             return border_edges > 100
-            
+
         except Exception as e:
             return False
 
@@ -1275,32 +1301,32 @@ class ProcessorService:
         try:
             # تبدیل به HSV
             hsv = cv2.cvtColor(field_image, cv2.COLOR_BGR2HSV)
-            
+
             # تشخیص ناحیه‌های highlight شده (معمولاً آبی روشن)
             lower_highlight = np.array([100, 30, 150])
             upper_highlight = np.array([130, 100, 255])
             highlight_mask = cv2.inRange(hsv, lower_highlight, upper_highlight)
-            
+
             # پیدا کردن مناطق highlight
             contours, _ = cv2.findContours(highlight_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
+
             selection_info = {
                 'has_selection': False,
                 'range': None
             }
-            
+
             if contours:
                 # بزرگترین ناحیه highlight را پیدا کن
                 largest_contour = max(contours, key=cv2.contourArea)
                 x, y, w, h = cv2.boundingRect(largest_contour)
-                
+
                 # اگر ناحیه به اندازه کافی بزرگ باشد
                 if w > 10 and h > 5:
                     selection_info['has_selection'] = True
                     selection_info['range'] = [x, y, x + w, y + h]
-            
+
             return selection_info
-            
+
         except Exception as e:
             return {'has_selection': False, 'range': None}
 
@@ -1310,7 +1336,7 @@ class ProcessorService:
         """
         try:
             height, width = field_image.shape[:2]
-            
+
             # تشخیص بر اساس ابعاد
             if height > width * 0.3:  # اگر ارتفاع بیش از 30% عرض باشد
                 return "textarea"
@@ -1318,19 +1344,19 @@ class ProcessorService:
                 return "input"
             else:
                 return "input"
-                
+
             # تشخیص password field (کاراکترهای mask شده)
             gray = cv2.cvtColor(field_image, cv2.COLOR_BGR2GRAY)
-            
+
             # تشخیص نقاط یا ستاره‌های تکراری
             circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, 20, param1=50, param2=30, minRadius=2, maxRadius=8)
-            
+
             if circles is not None and len(circles[0]) > 2:
                 return "password"
-            
+
         except Exception as e:
             pass
-        
+
         return "input"
 
     def draw_red_circle_on_image(self, input_image_path, point, output_image_path=None, circle_radius=20):
@@ -1374,9 +1400,9 @@ class ProcessorService:
         with Image.open(image_path) as img:
             return img.width, img.height
 
-    def draw_rectangles_on_image(self, input_image_path, coordinates, output_image_path=None):
+    def draw_polygons_on_image(self, input_image_path, coordinates, output_image_path=None):
         """
-        روی عکس ورودی مستطیل‌های قرمز برای هر المان در مختصات مشخص شده رسم می‌کند
+        روی عکس ورودی polygon های قرمز برای هر المان در مختصات مشخص شده رسم می‌کند
         """
         # باز کردن عکس
         if isinstance(input_image_path, str):
@@ -1389,31 +1415,38 @@ class ProcessorService:
 
         # خواندن ابعاد واقعی عکس
         real_width, real_height = self.get_image_dimensions(input_image_path)
-        desktop = None
-        for coordinate in coordinates.keys():
-            if 'desktop' == coordinate:
-                desktop = coordinates[coordinate]
-        if desktop is None:
-            return {}
-        scale_x = real_width / desktop[2]  # تقسیم عرض واقعی بر عرض مدل
-        scale_y = real_height / desktop[3]  # تقسیم ارتفاع واقعی بر ارتفاع مدل
 
         detail = {}
         for element_name, coords in coordinates.items():
             try:
-                if element_name != "desktop":  # از رسم مستطیل برای دسکتاپ صرف نظر می‌کنیم
-                    # مقیاس‌بندی مختصات
-                    x1 = coords[0] * scale_x
-                    y1 = coords[1] * scale_y
-                    x2 = coords[2] * scale_x
-                    y2 = coords[3] * scale_y
-                    detail[element_name] = ((x1, y1), (x2, y2))
-                    # رسم مستطیل
-                    draw.rectangle([(x1, y1), (x2, y2)], outline="red", width=2)
+                if element_name != "desktop":  # از رسم polygon برای دسکتاپ صرف نظر می‌کنیم
+                    if isinstance(coords, list) and len(coords) > 0 and isinstance(coords[0], list):
+                        # polygon format: [[x1, y1], [x2, y2], ...]
+                        polygon_points = []
+                        for point in coords:
+                            x, y = point[0], point[1]
+                            polygon_points.extend([x, y])
 
-                    # اضافه کردن نام المان
-                    draw.text((x1, y1 - 15), element_name, fill="red")
+                        detail[element_name] = coords
+
+                        # رسم polygon
+                        if len(polygon_points) >= 6:  # حداقل 3 نقطه (6 مختصات)
+                            draw.polygon(polygon_points, outline="red", width=2)
+
+                        # اضافه کردن نام المان در center polygon
+                        center_x = sum(point[0] for point in coords) // len(coords)
+                        center_y = sum(point[1] for point in coords) // len(coords)
+                        draw.text((center_x, center_y - 15), element_name, fill="red")
+
+                    elif isinstance(coords, list) and len(coords) == 4 and isinstance(coords[0], (int, float)):
+                        # rectangle format: [x1, y1, x2, y2] (fallback for YOLO)
+                        x1, y1, x2, y2 = coords
+                        detail[element_name] = ((x1, y1), (x2, y2))
+                        draw.rectangle([(x1, y1), (x2, y2)], outline="red", width=2)
+                        draw.text((x1, y1 - 15), element_name, fill="red")
+
             except Exception as e:
+                print(f"Error drawing element {element_name}: {e}")
                 pass
 
         # ذخیره یا نمایش
@@ -1428,37 +1461,37 @@ class ProcessorService:
     def process_task_step(self):
         try:
             self.step_id = int(time.time() * 1000)
-            
+
             # بررسی checkpoint موجود
             checkpoint = self.load_checkpoint()
-            
+
             # مقادیر پیش‌فرض
             screenshot_thought = None
             enhanced_prompt = None
             coordinates = None
-            
+
             # تعیین مرحله شروع بر اساس checkpoint
             if checkpoint:
                 self.processing_stage = checkpoint.get('processing_stage', 'start')
                 print(f"Resuming from checkpoint: {self.processing_stage}")
             else:
                 self.processing_stage = "start"
-            
-            # مرحله 1: Screenshot و Position Request
-            if self.processing_stage in ["start", "position"]:
+
+            # مرحله 1: Screenshot و Discovery Phase
+            if self.processing_stage in ["start", "discovery"]:
                 try:
-                    self.processing_stage = "position"
+                    self.processing_stage = "discovery"
                     screenshot_thought = self.append_screenshot()
                     print(f"screenshot: {screenshot_thought}")
-                    
-                    # ذخیره checkpoint پس از screenshot
-                    self.save_checkpoint("position_completed", {
+
+                    # ذخیره checkpoint پس از screenshot و discovery
+                    self.save_checkpoint("discovery_completed", {
                         'screenshot_thought': screenshot_thought
                     })
-                    
+
                 except Exception as e:
-                    print(f"Error in position stage: {e}")
-                    # حفظ checkpoint برای تلاش مجدد
+                    print(f"Error in discovery stage: {e}")
+                    traceback.format_exc()
                     raise e
             else:
                 # بازیابی از checkpoint
@@ -1466,19 +1499,41 @@ class ProcessorService:
                 print(f"Restored screenshot from checkpoint")
 
             # مرحله 2: Enhanced Prompt
-            if self.processing_stage in ["start", "position", "enhanced_prompt"]:
+            if self.processing_stage in ["start", "discovery", "enhanced_prompt"]:
                 try:
                     self.processing_stage = "enhanced_prompt"
-                    enhanced_prompt = self.task_rag.query_context(
+                    
+                    # دریافت context از RAG (سرچ سمانتیک)
+                    rag_context = self.task_rag.query_context(
                         self.user_id, f"Memory data: {self.current_task.description}"
                     )
                     
+                    # دریافت ۱۰ event اخیر بر اساس timestamp
+                    recent_events = self.task_rag.get_recent_events(self.user_id, limit=10)
+                    
+                    # ترکیب اطلاعات برای enhanced_prompt
+                    enhanced_prompt = ""
+                    
+                    if rag_context:
+                        enhanced_prompt += f"\n=== Related Context from Memory ===\n{rag_context}\n"
+                    
+                    if recent_events:
+                        enhanced_prompt += "\n=== Recent 10 Events (Chronological) ===\n"
+                        for i, event in enumerate(recent_events, 1):
+                            metadata = event.get('metadata', {})
+                            task_info = f"[Task {metadata.get('task_id')}: {metadata.get('task_description', 'N/A')}]" if metadata.get('task_id') else "[No Task Info]"
+                            event_type = metadata.get('event_type', 'unknown')
+                            timestamp = metadata.get('timestamp', 'N/A')
+                            content = event.get('content', '')
+                            enhanced_prompt += f"{i}. {task_info} [{event_type}] {timestamp}\n   {content}\n"
+                        enhanced_prompt += "===\n"
+
                     # ذخیره checkpoint پس از enhanced prompt
                     self.save_checkpoint("enhanced_prompt_completed", {
                         'screenshot_thought': screenshot_thought,
                         'enhanced_prompt': enhanced_prompt
                     })
-                    
+
                 except Exception as e:
                     print(f"Error in enhanced_prompt stage: {e}")
                     raise e
@@ -1487,10 +1542,10 @@ class ProcessorService:
                 enhanced_prompt = self.checkpoint_data.get('enhanced_prompt')
                 print(f"Restored enhanced_prompt from checkpoint")
             # مرحله 3: Action Request
-            if self.processing_stage in ["start", "position", "enhanced_prompt", "action"]:
+            if self.processing_stage in ["start", "discovery", "enhanced_prompt", "action"]:
                 try:
                     self.processing_stage = "action"
-                    
+
                     action_prompt = f"""Based on the recent actions and screenshot analysis and task objective, determine the next action to take.
 
                     Screenshot analysis:
@@ -1525,7 +1580,19 @@ class ProcessorService:
                             - Only physically click on the **window itself** when focus is actually needed
                             - Example: For "LX Terminal," click the terminal window, not the LX Terminal icon.
                             - Verify focus by checking window attributes (title, active state) before proceeding.
-                    5. In send_key for enter something you should use `Return` word
+                    5. KEYBOARD KEY COMBINATIONS (IMPORTANT):
+                        - send_key accepts a LIST of keys, not a string
+                        - For single keys: ["Return"] or ["Enter"] or ["Escape"] or ["Tab"]
+                        - For key combinations: ["Control_L", "l"] for Ctrl+L, ["Alt_L", "Tab"] for Alt+Tab
+                        - Key mappings:
+                            * Ctrl → "Control_L"
+                            * Alt → "Alt_L"
+                            * Shift → "Shift_L"
+                            * Super/Windows → "Super_L"
+                            * Enter/Return → "Return"
+                            * Backspace → "BackSpace"
+                            * Delete → "Delete"
+                        - NEVER use strings like "Ctrl+L" or "ctrl+l", always use list format: ["Control_L", "l"]
                     6. If you want apps opened in the taskbar you should say it's name that you hve in screenshot analysis
                     7. For ensure the apps is focused you need to click on them before the main action. But ONLY if they weren't focused recently
                     8. For each action of screenshot thought you should give me one action
@@ -1570,8 +1637,10 @@ class ProcessorService:
                         y['parameters']["image_height"] = "The screenshot height size"
                         y['parameters']["description"] = "Reason"
                         y['parameters']["memory_data"] = "The things need to save in memory // it's REQUIRED"
+                        y['parameters']["expected_outcome"] = "What you expect to happen after this action (be specific)"
 
-                    logService.append_log(self.step_id, self.current_task.id, enhanced_prompt + action_prompt, 'action_request',
+                    logService.append_log(self.step_id, self.current_task.id, enhanced_prompt + action_prompt,
+                                          'action_request',
                                           DataService().get_user_path_screenshot(self.user_id))
                     self.websocket_manager.send_to_user_with_format(self.system_user.id, WebSocketType.ACTION_REQUEST, {
                         'user_id': self.user_id,
@@ -1579,21 +1648,23 @@ class ProcessorService:
                     })
                     # تبدیل به فرمت استرینگ برای سازگاری با OllamaProvider
                     full_prompt = enhanced_prompt + action_prompt
-                    response = action_model.call(full_prompt, DataService().get_user_path_screenshot(self.user_id), tools)
+                    response = action_model.call(full_prompt, DataService().get_user_path_screenshot(self.user_id),
+                                                 tools)
                     logService.append_log(self.step_id, self.current_task.id, json.dumps(response), 'action_response')
                     print(f'ACTION MODEL RESPONSE: {response}')
-                    self.websocket_manager.send_to_user_with_format(self.system_user.id, WebSocketType.ACTION_RESPONSE, {
-                        'user_id': self.user_id,
-                        'response': response[1],
-                    })
-                    
+                    self.websocket_manager.send_to_user_with_format(self.system_user.id, WebSocketType.ACTION_RESPONSE,
+                                                                    {
+                                                                        'user_id': self.user_id,
+                                                                        'response': response[1],
+                                                                    })
+
                     # ذخیره checkpoint پس از دریافت response
                     self.save_checkpoint("action_completed", {
                         'screenshot_thought': screenshot_thought,
                         'enhanced_prompt': enhanced_prompt,
                         'action_response': response
                     })
-                    
+
                 except Exception as e:
                     print(f"Error in action stage: {e}")
                     raise e
@@ -1604,32 +1675,109 @@ class ProcessorService:
 
             can_continue = True
             for tool_call in response[1]:
+                action = None
                 try:
-                    action = tool_call['name']
-                    args = deepcopy(tool_call['parameters'])
-                    memory_data = args['memory_data']
-                    self.task_rag.add_text(self.user_id,
-                                           "event: " + str(memory_data) + " timestamp: " + datetime.now().isoformat())
+                    # بررسی ساختار tool_call و استخراج action و args
+                    if 'name' in tool_call and 'parameters' in tool_call:
+                        # ساختار استاندارد: {'name': 'action_name', 'parameters': {...}}
+                        action = tool_call['name']
+                        args = deepcopy(tool_call['parameters'])
+                    else:
+                        # ساختار جایگزین: {'action_name': {'parameters': {...}}}
+                        # پیدا کردن اولین کلید که یک dict با 'parameters' است
+                        found = False
+                        for key, value in tool_call.items():
+                            if isinstance(value, dict) and 'parameters' in value:
+                                action = key
+                                args = deepcopy(value['parameters'])
+                                found = True
+                                break
+                        
+                        if not found:
+                            print(f"Warning: Could not extract action from tool_call structure: {tool_call}")
+                            continue
+                    
+                    if not action:
+                        print(f"Warning: Action name is None, skipping tool_call: {tool_call}")
+                        continue
+                    
+                    memory_data = args.get('memory_data')
+                    if memory_data:
+                        # ذخیره event با metadata تسک
+                        task_metadata = {
+                            'task_id': self.current_task.id if self.current_task else None,
+                            'task_description': self.current_task.description if self.current_task else None,
+                            'timestamp': datetime.now().isoformat(),
+                            'event_type': 'memory_data'
+                        }
+                        self.task_rag.add_text(
+                            self.user_id, 
+                            "event: " + str(memory_data), 
+                            metadata=task_metadata
+                        )
+                    
+                    # استخراج expected_outcome برای validation در screenshot بعدی
+                    expected_outcome = args.get('expected_outcome', '')
+                    
                     print(f'action: {action} args: {args}')
 
                     if hasattr(self, action):
-                        if args['image_width'] and args['image_height']:
-                            self.model_height = float(args['image_height'])
-                            self.model_width = float(args['image_width'])
-                        args.pop('image_height')
-                        args.pop('image_width')
-                        args.pop('last_action_result')
-                        args.pop('memory_data')
+                        # استفاده از ابعاد از LLM parameters فقط به عنوان fallback (اگر از detector نیامده باشد)
+                        if args.get('image_width') and args.get('image_height'):
+                            llm_width = float(args['image_width'])
+                            llm_height = float(args['image_height'])
+                            # اگر ابعاد از detector تنظیم نشده، از LLM استفاده کن
+                            if not hasattr(self, 'model_width') or not hasattr(self, 'model_height'):
+                                self.model_width = llm_width
+                                self.model_height = llm_height
+                                print(f"Using screen dimensions from LLM (fallback): {self.model_width}x{self.model_height}")
+                            else:
+                                print(f"Screen dimensions already set from detector: {self.model_width}x{self.model_height}, LLM provided: {llm_width}x{llm_height}")
+                        
+                        # حذف پارامترهای اضافی قبل از اجرای action
+                        args.pop('image_height', None)
+                        args.pop('image_width', None)
+                        args.pop('last_action_result', None)
+                        args.pop('memory_data', None)
+                        args.pop('expected_outcome', None)
+                        
+                        # ذخیره اطلاعات action قبل از اجرا برای validation بعدی
+                        action_coordinates = None
+                        if 'x' in args and 'y' in args:
+                            action_coordinates = (args['x'], args['y'])
+                        
+                        # اجرای action
                         result = getattr(self, action)(**args)
+                        
+                        # ذخیره اطلاعات action برای validation در vision بعدی
+                        self.last_action_info = {
+                            'action_type': action,
+                            'coordinates': action_coordinates,
+                            'expected_outcome': expected_outcome,
+                            'timestamp': datetime.now().isoformat(),
+                            'args': args.copy()
+                        }
 
+                        # ذخیره action با metadata تسک
+                        action_metadata = {
+                            'task_id': self.current_task.id if self.current_task else None,
+                            'task_description': self.current_task.description if self.current_task else None,
+                            'timestamp': datetime.now().isoformat(),
+                            'event_type': 'action',
+                            'action_name': action
+                        }
                         self.task_rag.add_text(
-                            self.user_id, "action: " + action + " args:" + " ".join(
-                                f'{k}: {v}' for k, v in args.items()) + " timestamp: " + datetime.now().isoformat()
+                            self.user_id,
+                            "action: " + action + " args: " + " ".join(
+                                f'{k}: {v}' for k, v in args.items()),
+                            metadata=action_metadata
                         )
 
                         # اگر action ایجاد تسک بود و تسک جدید اولویت بالاتری داشت، باید ادامه ندهیم
                         if action == "create_task" and "switched to higher priority task" in result:
                             can_continue = False
+                    else:
+                        print(f"Warning: Action '{action}' not found as a method in processor service")
 
                     # ذخیره پیام تسک
                     self.current_task.task_messages.append(
@@ -1648,7 +1796,9 @@ class ProcessorService:
 
                 except Exception as e:
                     traceback.print_exc()
-                    print(f"Error processing tool call {action}: {str(e)}")
+                    action_str = action if action else "unknown"
+                    print(f"Error processing tool call {action_str}: {str(e)}")
+                    print(f"Tool call structure: {tool_call}")
                     continue
 
             # در صورت تکمیل موفق، checkpoint را پاک کن
@@ -1843,7 +1993,6 @@ class ProcessorService:
 
         return list(reversed(actions[-count:]))
 
-
     def _execute_action_sequence(self, action_chain):
         """اجرای کامل یک دنباله اکشن با pre و post actions"""
         try:
@@ -1973,7 +2122,7 @@ class ProcessorService:
         try:
             checkpoint_path = DataService().get_user_checkpoint_path(self.user_id, self.step_id)
             os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-            
+
             checkpoint = {
                 'stage': stage,
                 'step_id': self.step_id,
@@ -1984,13 +2133,13 @@ class ProcessorService:
                 'model_width': self.model_width,
                 'model_height': self.model_height
             }
-            
+
             with open(checkpoint_path, 'w', encoding='utf-8') as f:
                 json.dump(checkpoint, f, ensure_ascii=False, indent=2)
-                
-            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0, 
-                                f'checkpoint_saved: {stage}', 'checkpoint')
-            
+
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f'checkpoint_saved: {stage}', 'checkpoint')
+
         except Exception as e:
             print(f"Error saving checkpoint: {e}")
 
@@ -2000,24 +2149,24 @@ class ProcessorService:
         """
         try:
             checkpoint_path = DataService().get_user_checkpoint_path(self.user_id, self.step_id)
-            
+
             if os.path.exists(checkpoint_path):
                 with open(checkpoint_path, 'r', encoding='utf-8') as f:
                     checkpoint = json.load(f)
-                
+
                 self.processing_stage = checkpoint.get('processing_stage', 'start')
                 self.checkpoint_data = checkpoint.get('data', {})
                 self.model_width = checkpoint.get('model_width')
                 self.model_height = checkpoint.get('model_height')
-                
-                logService.append_log(self.step_id, checkpoint.get('task_id', 0), 
-                                    f'checkpoint_loaded: {checkpoint.get("stage")}', 'checkpoint')
-                
+
+                logService.append_log(self.step_id, checkpoint.get('task_id', 0),
+                                      f'checkpoint_loaded: {checkpoint.get("stage")}', 'checkpoint')
+
                 return checkpoint
-                
+
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
-            
+
         return None
 
     def clear_checkpoint(self):
@@ -2028,28 +2177,44 @@ class ProcessorService:
             checkpoint_path = DataService().get_user_checkpoint_path(self.user_id, self.step_id)
             if os.path.exists(checkpoint_path):
                 os.remove(checkpoint_path)
-                
+
             self.checkpoint_data = {}
             self.processing_stage = "start"
-            
+
         except Exception as e:
             print(f"Error clearing checkpoint: {e}")
 
-    def crop_element_image(self, image_path: str, coordinates: list) -> np.ndarray:
+    def crop_element_image(self, image_path: str, coordinates) -> np.ndarray:
         """
-        برش المان از تصویر اصلی
+        برش المان از تصویر اصلی - پشتیبانی از polygon و rectangle
         """
         try:
             image = cv2.imread(image_path)
-            x1, y1, x2, y2 = coordinates
-            
+
+            # تشخیص نوع coordinates
+            if isinstance(coordinates, list) and len(coordinates) > 0:
+                if isinstance(coordinates[0], list):
+                    # polygon format: [[x1, y1], [x2, y2], ...]
+                    bbox = self.polygon_to_bbox(coordinates)
+                    x1, y1, x2, y2 = bbox
+                elif len(coordinates) == 4 and isinstance(coordinates[0], (int, float)):
+                    # rectangle format: [x1, y1, x2, y2]
+                    x1, y1, x2, y2 = coordinates
+                else:
+                    raise ValueError("Invalid coordinates format")
+            else:
+                raise ValueError("Invalid coordinates")
+
             # اطمینان از مختصات معتبر
-            x1, y1 = max(0, x1), max(0, y1)
-            x2 = min(image.shape[1], x2)
-            y2 = min(image.shape[0], y2)
-            
+            x1, y1 = max(0, int(x1)), max(0, int(y1))
+            x2 = min(image.shape[1], int(x2))
+            y2 = min(image.shape[0], int(y2))
+
+            if x2 <= x1 or y2 <= y1:
+                return None
+
             cropped = image[y1:y2, x1:x2]
-            
+
             # اضافه کردن padding اگر المان خیلی کوچک باشد
             if cropped.shape[0] < 32 or cropped.shape[1] < 32:
                 padding = 10
@@ -2058,9 +2223,9 @@ class ProcessorService:
                 x2_padded = min(image.shape[1], x2 + padding)
                 y2_padded = min(image.shape[0], y2 + padding)
                 cropped = image[y1_padded:y2_padded, x1_padded:x2_padded]
-            
+
             return cropped
-            
+
         except Exception as e:
             print(f"Error cropping element: {e}")
             return None
@@ -2072,46 +2237,66 @@ class ProcessorService:
         try:
             # بارگذاری تصویر اصلی
             original = cv2.imread(original_image_path)
-            
+
             # resize المان crop شده
             crop_height, crop_width = element_crop.shape[:2]
             max_crop_size = 200
-            
+
             if crop_height > max_crop_size or crop_width > max_crop_size:
                 scale = max_crop_size / max(crop_height, crop_width)
                 new_width = int(crop_width * scale)
                 new_height = int(crop_height * scale)
                 element_crop = cv2.resize(element_crop, (new_width, new_height))
-            
+
             # ایجاد border قرمز دور المان crop شده
             bordered_crop = cv2.copyMakeBorder(
-                element_crop, 5, 5, 5, 5, 
-                cv2.BORDER_CONSTANT, 
+                element_crop, 5, 5, 5, 5,
+                cv2.BORDER_CONSTANT,
                 value=[0, 0, 255]  # قرمز
             )
-            
+
             # resize تصویر اصلی اگر لازم باشد
             orig_height, orig_width = original.shape[:2]
             max_original_width = 800
-            
+
             if orig_width > max_original_width:
                 scale = max_original_width / orig_width
                 new_width = int(orig_width * scale)
                 new_height = int(orig_height * scale)
                 original = cv2.resize(original, (new_width, new_height))
-            
-            # رسم مستطیل قرمز در موقعیت المان در تصویر اصلی
-            x1, y1, x2, y2 = coordinates
-            if orig_width > max_original_width:
-                scale = max_original_width / orig_width
-                x1, y1, x2, y2 = int(x1*scale), int(y1*scale), int(x2*scale), int(y2*scale)
-            
-            cv2.rectangle(original, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            
+
+            # رسم شکل قرمز در موقعیت المان در تصویر اصلی (polygon یا rectangle)
+            if isinstance(coordinates, list) and len(coordinates) > 0:
+                if isinstance(coordinates[0], list):
+                    # polygon format: [[x1, y1], [x2, y2], ...]
+                    scaled_points = []
+                    if orig_width > max_original_width:
+                        scale = max_original_width / orig_width
+                        for point in coordinates:
+                            scaled_x = int(point[0] * scale)
+                            scaled_y = int(point[1] * scale)
+                            scaled_points.append([scaled_x, scaled_y])
+                    else:
+                        scaled_points = coordinates
+
+                    # تبدیل به format مناسب cv2
+                    polygon_points = np.array(scaled_points, np.int32)
+                    polygon_points = polygon_points.reshape((-1, 1, 2))
+                    cv2.polylines(original, [polygon_points], True, (0, 0, 255), 3)
+
+                elif len(coordinates) == 4:
+                    # rectangle format: [x1, y1, x2, y2]
+                    x1, y1, x2, y2 = coordinates
+                    if orig_width > max_original_width:
+                        scale = max_original_width / orig_width
+                        x1, y1, x2, y2 = int(x1 * scale), int(y1 * scale), int(x2 * scale), int(y2 * scale)
+
+                    cv2.rectangle(original, (x1, y1), (x2, y2), (0, 0, 255), 3)
+
             # ترکیب دو تصویر کنار هم
             crop_resized_height, crop_resized_width = bordered_crop.shape[:2]
             original_height, original_width = original.shape[:2]
-            
+
             # تنظیم ارتفاع برای ترکیب
             if original_height != crop_resized_height:
                 if original_height > crop_resized_height:
@@ -2127,18 +2312,18 @@ class ProcessorService:
                     scale = crop_resized_height / original_height
                     new_width = int(original_width * scale)
                     original = cv2.resize(original, (new_width, crop_resized_height))
-            
+
             # ترکیب تصاویر
             combined = np.hstack((original, bordered_crop))
-            
+
             # ذخیره تصویر ترکیبی
             timestamp = str(int(time.time()))
             discovery_image_path = f"orchestrator_data/discovery/discovery_{self.user_id}_{timestamp}.png"
             os.makedirs(os.path.dirname(discovery_image_path), exist_ok=True)
             cv2.imwrite(discovery_image_path, combined)
-            
+
             return discovery_image_path
-            
+
         except Exception as e:
             print(f"Error creating discovery image: {e}")
             return None
@@ -2148,78 +2333,90 @@ class ProcessorService:
         فرآیند Discovery: شناسایی المان‌های ناشناخته با vision model
         """
         try:
+            # ذخیره عکس crop شده برای لاگ شروع discovery
+            element_crop = self.crop_element_image(image_path, coordinates)
+            element_crop_start_path = None
+            if element_crop is not None:
+                element_crop_start_path = f"orchestrator_data/discovery/start_crop_{self.user_id}_{self.step_id}_{element_name}.png"
+                os.makedirs(os.path.dirname(element_crop_start_path), exist_ok=True)
+                cv2.imwrite(element_crop_start_path, element_crop)
+
             logService.append_log(
-                self.step_id, 
+                self.step_id,
                 self.current_task.id if self.current_task else 0,
                 f"Starting discovery for element: {element_name} at coordinates: {coordinates}",
                 'discovery_start',
-                None
+                element_crop_start_path
             )
-            
+
             # WebSocket notification
             self.websocket_manager.send_to_user_with_format(
-                self.system_user.id, 
-                WebSocketType.DISCOVERY_ELEMENT_START, 
+                self.system_user.id,
+                WebSocketType.DISCOVERY_ELEMENT_START,
                 {'user_id': self.user_id, 'element_name': element_name, 'coordinates': coordinates}
             )
-            
-            # بررسی memory برای المان
-            element_crop = self.crop_element_image(image_path, coordinates)
+
+            # بررسی memory برای المان - استفاده از element_crop که قبلاً ایجاد شده
             if element_crop is None:
                 return {"error": "Could not crop element"}
-            
+
             memory_service = get_element_memory_service()
             element_signature = memory_service.generate_element_signature(element_crop, coordinates)
-            
+
             # بررسی وجود در memory
             cached_element = memory_service.check_element_in_memory(element_signature)
             if cached_element:
                 logService.append_log(
-                    self.step_id, 
+                    self.step_id,
                     self.current_task.id if self.current_task else 0,
                     f"Element found in memory: {json.dumps(cached_element, indent=2, ensure_ascii=False)}",
                     'discovery_memory_hit',
                     None
                 )
-                
+
                 # WebSocket notification
                 self.websocket_manager.send_to_user_with_format(
-                    self.system_user.id, 
-                    WebSocketType.DISCOVERY_MEMORY_HIT, 
+                    self.system_user.id,
+                    WebSocketType.DISCOVERY_MEMORY_HIT,
                     {
-                        'user_id': self.user_id, 
+                        'user_id': self.user_id,
                         'element_name': element_name,
                         'element_type': cached_element.get('element_type', 'unknown')
                     }
                 )
-                
+
                 return {
                     "source": "memory",
                     "element_info": cached_element,
                     "signature": element_signature
                 }
-            
+
             # Element در memory نیست، باید discovery کنیم
+            # ذخیره عکس crop شده برای لاگ
+            element_crop_path = f"orchestrator_data/discovery/element_crop_{self.user_id}_{self.step_id}_{element_name}.png"
+            os.makedirs(os.path.dirname(element_crop_path), exist_ok=True)
+            cv2.imwrite(element_crop_path, element_crop)
+
             logService.append_log(
-                self.step_id, 
+                self.step_id,
                 self.current_task.id if self.current_task else 0,
                 f"Element not found in memory. Starting AI discovery for signature: {element_signature}",
                 'discovery_memory_miss',
-                None
+                element_crop_path
             )
-            
+
             # WebSocket notification
             self.websocket_manager.send_to_user_with_format(
-                self.system_user.id, 
-                WebSocketType.DISCOVERY_MEMORY_MISS, 
+                self.system_user.id,
+                WebSocketType.DISCOVERY_MEMORY_MISS,
                 {'user_id': self.user_id, 'element_name': element_name, 'signature': element_signature}
             )
-            
+
             # ایجاد تصویر ترکیبی برای discovery
             discovery_image_path = self.create_discovery_image(image_path, element_crop, coordinates)
             if not discovery_image_path:
                 return {"error": "Could not create discovery image"}
-            
+
             # پرامپت discovery
             discovery_prompt = f"""Analyze this UI element carefully. I need you to identify what type of element this is and what it represents.
 
@@ -2250,42 +2447,42 @@ Respond in JSON format:
 }}"""
 
             logService.append_log(
-                self.step_id, 
+                self.step_id,
                 self.current_task.id if self.current_task else 0,
                 discovery_prompt,
                 'discovery_prompt',
                 discovery_image_path
             )
-            
+
             # WebSocket notification - AI Request
             self.websocket_manager.send_to_user_with_format(
-                self.system_user.id, 
-                WebSocketType.DISCOVERY_AI_REQUEST, 
+                self.system_user.id,
+                WebSocketType.DISCOVERY_AI_REQUEST,
                 {'user_id': self.user_id, 'element_name': element_name}
             )
-            
+
             # فراخوانی vision model
             response = vision_model.call(discovery_prompt, discovery_image_path)
-            
+
             # WebSocket notification - AI Response
             self.websocket_manager.send_to_user_with_format(
-                self.system_user.id, 
-                WebSocketType.DISCOVERY_AI_RESPONSE, 
+                self.system_user.id,
+                WebSocketType.DISCOVERY_AI_RESPONSE,
                 {'user_id': self.user_id, 'element_name': element_name}
             )
-            
+
             logService.append_log(
-                self.step_id, 
+                self.step_id,
                 self.current_task.id if self.current_task else 0,
                 response,
                 'discovery_response',
                 None
             )
-            
+
             # پردازش پاسخ
             try:
                 element_info = json.loads(response)
-                
+
                 # اعتبارسنجی و تمیز کردن پاسخ
                 element_info.setdefault("element_type", "unknown")
                 element_info.setdefault("purpose", "")
@@ -2294,40 +2491,40 @@ Respond in JSON format:
                 element_info.setdefault("category", "unknown")
                 element_info.setdefault("description", "")
                 element_info.setdefault("confidence", 0.5)
-                
+
                 # تمیز کردن اطلاعات برای ذخیره در memory (حذف metadata اضافی)
                 clean_element_info = self.clean_element_info_for_memory(element_info)
-                
+
                 # ذخیره در memory
                 memory_service.save_element_to_memory(element_signature, clean_element_info)
-                
+
                 logService.append_log(
-                    self.step_id, 
+                    self.step_id,
                     self.current_task.id if self.current_task else 0,
                     f"Discovery completed successfully. Element saved to memory: {json.dumps(element_info, indent=2, ensure_ascii=False)}",
                     'discovery_success',
-                    None
+                    discovery_image_path
                 )
-                
+
                 # WebSocket notification - Element Complete
                 self.websocket_manager.send_to_user_with_format(
-                    self.system_user.id, 
-                    WebSocketType.DISCOVERY_ELEMENT_COMPLETE, 
+                    self.system_user.id,
+                    WebSocketType.DISCOVERY_ELEMENT_COMPLETE,
                     {
-                        'user_id': self.user_id, 
+                        'user_id': self.user_id,
                         'element_name': element_name,
                         'discovered_type': element_info.get('element_type', 'unknown'),
                         'success': True
                     }
                 )
-                
+
                 return {
                     "source": "discovery",
                     "element_info": element_info,
                     "signature": element_signature,
                     "discovery_image_path": discovery_image_path
                 }
-                
+
             except json.JSONDecodeError:
                 # اگر پاسخ JSON نبود، پاسخ ساده ایجاد کن
                 element_info = {
@@ -2340,44 +2537,44 @@ Respond in JSON format:
                     "confidence": 0.3,
                     "raw_response": response
                 }
-                
+
                 # تمیز کردن اطلاعات برای ذخیره در memory
                 clean_element_info = self.clean_element_info_for_memory(element_info)
-                
+
                 memory_service.save_element_to_memory(element_signature, clean_element_info)
-                
+
                 logService.append_log(
-                    self.step_id, 
+                    self.step_id,
                     self.current_task.id if self.current_task else 0,
                     f"Discovery completed with non-JSON response. Element saved: {json.dumps(element_info, indent=2, ensure_ascii=False)}",
                     'discovery_partial_success',
-                    None
+                    discovery_image_path
                 )
-                
+
                 # WebSocket notification - Element Complete (Partial)
                 self.websocket_manager.send_to_user_with_format(
-                    self.system_user.id, 
-                    WebSocketType.DISCOVERY_ELEMENT_COMPLETE, 
+                    self.system_user.id,
+                    WebSocketType.DISCOVERY_ELEMENT_COMPLETE,
                     {
-                        'user_id': self.user_id, 
+                        'user_id': self.user_id,
                         'element_name': element_name,
                         'discovered_type': element_info.get('element_type', 'unknown'),
                         'success': True,
                         'partial': True
                     }
                 )
-                
+
                 return {
                     "source": "discovery",
                     "element_info": element_info,
                     "signature": element_signature,
                     "discovery_image_path": discovery_image_path
                 }
-            
+
         except Exception as e:
             error_msg = f"Error in discovery process: {str(e)}\n{traceback.format_exc()}"
             logService.append_log(
-                self.step_id, 
+                self.step_id,
                 self.current_task.id if self.current_task else 0,
                 error_msg,
                 'discovery_error',
@@ -2391,57 +2588,57 @@ Respond in JSON format:
         """
         try:
             logService.append_log(
-                self.step_id, 
+                self.step_id,
                 self.current_task.id if self.current_task else 0,
                 f"Starting element discovery phase for {len(coordinates)} elements",
                 'discovery_phase_start',
                 None
             )
-            
+
             # WebSocket notification
             self.websocket_manager.send_to_user_with_format(
-                self.system_user.id, 
-                WebSocketType.DISCOVERY_PHASE_START, 
+                self.system_user.id,
+                WebSocketType.DISCOVERY_PHASE_START,
                 {'user_id': self.user_id, 'total_elements': len(coordinates)}
             )
-            
+
             # شناسایی المان‌های ناشناخته (غیر از desktop)
             unknown_elements = []
             for element_name, coords in coordinates.items():
                 if element_name == "desktop":
                     continue
-                    
+
                 # تشخیص اینکه آیا المان ناشناخته است
                 if self.is_unknown_element(element_name, coords):
                     unknown_elements.append((element_name, coords))
-            
+
             logService.append_log(
-                self.step_id, 
+                self.step_id,
                 self.current_task.id if self.current_task else 0,
                 f"Found {len(unknown_elements)} unknown elements to discover: {[elem[0] for elem in unknown_elements]}",
                 'discovery_unknown_count',
                 None
             )
-            
+
             # اجرای discovery برای هر المان ناشناخته
             discovered_elements = {}
             for element_name, coords in unknown_elements:
                 try:
                     discovery_result = self.discover_unknown_element(element_name, coords, image_path)
-                    
+
                     if "error" not in discovery_result:
                         element_info = discovery_result.get("element_info", {})
-                        
+
                         # بهبود نام المان بر اساس discovery
                         improved_name = self.generate_improved_element_name(element_name, element_info)
-                        
+
                         # اگر نام بهبود یافت، مختصات را با نام جدید ذخیره کن
                         if improved_name != element_name:
                             discovered_elements[improved_name] = coords
                             discovered_elements[f"{improved_name}_discovery_info"] = element_info
-                            
+
                             logService.append_log(
-                                self.step_id, 
+                                self.step_id,
                                 self.current_task.id if self.current_task else 0,
                                 f"Element '{element_name}' improved to '{improved_name}' based on discovery",
                                 'discovery_element_improved',
@@ -2450,41 +2647,41 @@ Respond in JSON format:
                         else:
                             # نام تغییر نکرد، فقط اطلاعات discovery را اضافه کن
                             discovered_elements[f"{element_name}_discovery_info"] = element_info
-                    
+
                 except Exception as e:
                     logService.append_log(
-                        self.step_id, 
+                        self.step_id,
                         self.current_task.id if self.current_task else 0,
                         f"Error discovering element '{element_name}': {str(e)}",
                         'discovery_element_error',
                         None
                     )
-            
+
             # اضافه کردن المان‌های discovered به مختصات اصلی
             coordinates.update(discovered_elements)
-            
+
             logService.append_log(
-                self.step_id, 
+                self.step_id,
                 self.current_task.id if self.current_task else 0,
                 f"Discovery phase completed. Added {len(discovered_elements)} new entries to coordinates",
                 'discovery_phase_complete',
                 None
             )
-            
+
             # WebSocket notification
             self.websocket_manager.send_to_user_with_format(
-                self.system_user.id, 
-                WebSocketType.DISCOVERY_PHASE_COMPLETE, 
+                self.system_user.id,
+                WebSocketType.DISCOVERY_PHASE_COMPLETE,
                 {
-                    'user_id': self.user_id, 
+                    'user_id': self.user_id,
                     'discovered_count': len(discovered_elements),
                     'total_unknown': len(unknown_elements)
                 }
             )
-            
+
         except Exception as e:
             logService.append_log(
-                self.step_id, 
+                self.step_id,
                 self.current_task.id if self.current_task else 0,
                 f"Error in discovery phase: {str(e)}\n{traceback.format_exc()}",
                 'discovery_phase_error',
@@ -2500,21 +2697,21 @@ Respond in JSON format:
             'desktop', 'browser_window', 'terminal_window', 'start_menu',
             'system_clock', 'taskbar', 'notification_area'
         ]
-        
+
         # بررسی الگوهای شناخته شده
         for pattern in known_patterns:
             if pattern in element_name.lower():
                 return False
-        
+
         # المان‌های YOLO اصلی (با شماره) معمولاً ناشناخته هستند
         if any(pattern in element_name for pattern in ['button_', 'text_element_', 'ui_', 'desktop_icon_']):
             return True
-        
+
         # المان‌های با نام‌های غیرواضح
         generic_patterns = ['element', 'object', 'item', 'unknown', 'detected']
         if any(pattern in element_name.lower() for pattern in generic_patterns):
             return True
-        
+
         return False
 
     def generate_improved_element_name(self, original_name: str, element_info: dict) -> str:
@@ -2525,7 +2722,7 @@ Respond in JSON format:
             element_type = element_info.get("element_type", "").lower()
             text_content = element_info.get("text_content", "").strip()
             purpose = element_info.get("purpose", "").lower()
-            
+
             # اگر متن مشخصی دارد، از آن استفاده کن
             if text_content:
                 # تمیز کردن متن برای استفاده در نام
@@ -2537,7 +2734,7 @@ Respond in JSON format:
                         return f"{clean_text}_button"
                     else:
                         return f"{clean_text}_{element_type}"
-            
+
             # اگر نوع مشخصی دارد
             if element_type and element_type != "unknown":
                 if "button" in original_name:
@@ -2546,13 +2743,13 @@ Respond in JSON format:
                     return f"{element_type}_icon"
                 else:
                     return f"{element_type}_element"
-            
+
             # اگر purpose مشخصی دارد
             if purpose and "unknown" not in purpose:
                 purpose_clean = "".join(c for c in purpose if c.isalnum() or c in ['_', '-']).lower()
                 if purpose_clean:
                     return f"{purpose_clean}_element"
-            
+
             # اگر هیچ بهبودی ممکن نیست، نام اصلی را برگردان
             return original_name
         except Exception as e:
@@ -2563,29 +2760,38 @@ Respond in JSON format:
         فیلتر کردن coordinates برای vision model - حذف discovery metadata و اطلاعات اضافی
         """
         filtered_coords = {}
-        
+
         for element_name, coords in coordinates.items():
             # حذف discovery info entries
             if "_discovery_info" in element_name:
                 continue
-                
+
             # حذف detailed character/word analysis
             if any(suffix in element_name for suffix in [
-                "_char_", "_word_", "_full_text", "_text_content", 
+                "_char_", "_word_", "_full_text", "_text_content",
                 "_char_count", "_word_count", "_cursor"
             ]):
                 continue
-            
-            # نگه داشتن فقط main elements با coordinates
-            if isinstance(coords, list) and len(coords) == 4:
-                # اطمینان از اینکه coordinates لیست 4 عنصری هست
+
+            # نگه داشتن فقط main elements با coordinates (polygon یا rectangle)
+            if isinstance(coords, list) and len(coords) > 0:
                 try:
-                    clean_coords = [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])]
-                    filtered_coords[element_name] = clean_coords
+                    if isinstance(coords[0], list):
+                        # polygon format: [[x1, y1], [x2, y2], ...]
+                        clean_coords = []
+                        for point in coords:
+                            if len(point) == 2:
+                                clean_coords.append([int(point[0]), int(point[1])])
+                        if len(clean_coords) >= 3:  # حداقل 3 نقطه برای polygon معتبر
+                            filtered_coords[element_name] = clean_coords
+                    elif len(coords) == 4 and isinstance(coords[0], (int, float)):
+                        # rectangle format: [x1, y1, x2, y2]
+                        clean_coords = [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])]
+                        filtered_coords[element_name] = clean_coords
                 except (ValueError, TypeError):
                     # اگر coords قابل تبدیل به int نباشند، skip کن
                     continue
-        
+
         return filtered_coords
 
     def clean_element_info_for_memory(self, element_info: dict) -> dict:
@@ -2595,18 +2801,1198 @@ Respond in JSON format:
         # فیلدهای مجاز برای ذخیره در memory
         allowed_fields = {
             "element_type",
-            "purpose", 
+            "purpose",
             "text_content",
             "is_clickable",
             "category",
             "description",
             "confidence"
         }
-        
+
         clean_info = {}
         for key, value in element_info.items():
             if key in allowed_fields:
                 clean_info[key] = value
-        
+
         return clean_info
+
+    def perform_element_discovery_for_vision(self, coordinates: dict, image_path: str) -> dict:
+        """
+        اجرای فرآیند discovery برای vision model - برگرداندن enhanced coordinates با توضیحات
+        پشتیبانی از desktop, mobile, tablet و polygon coordinates از SAM
+        """
+        try:
+            logService.append_log(
+                self.step_id,
+                self.current_task.id if self.current_task else 0,
+                f"Starting enhanced element discovery for vision with {len(coordinates)} elements",
+                'discovery_for_vision_start',
+                None
+            )
+
+            # WebSocket notification
+            self.websocket_manager.send_to_user_with_format(
+                self.system_user.id,
+                WebSocketType.DISCOVERY_PHASE_START,
+                {'user_id': self.user_id, 'total_elements': len(coordinates), 'for_vision': True}
+            )
+
+            enhanced_coords = {}
+            discovery_results = {}
+
+            # تشخیص نوع platform بر اساس ابعاد تصویر
+            real_width, real_height = self.get_image_dimensions(image_path)
+            platform_type = self.detect_platform_type(real_width, real_height)
+
+            # Scale coordinates from SAM model size to original image size
+            scaled_coordinates = self.scale_sam_coordinates_to_original(coordinates, real_width, real_height)
+
+            # رسم polygons برای coordinates مقیاس‌شده و ذخیره در لاگ
+            scaled_output_path = DataService().get_user_path_screenshot_with_coordinates_scaled(self.user_id,
+                                                                                                self.step_id)
+            scaled_details = self.draw_polygons_on_image(
+                DataService().get_user_path_screenshot(self.user_id),
+                scaled_coordinates,
+                scaled_output_path
+            )
+
+            # لاگ اطلاعات scaled coordinates
+            if scaled_details != {}:
+                logService.append_log(self.step_id, self.current_task.id,
+                                      f'Scaled coordinates: real_width: {real_width}, real_height: {real_height}, Scaled elements: {len(scaled_coordinates)}, detail: {scaled_details}',
+                                      'scaled_coordinates',
+                                      scaled_output_path)
+
+            logService.append_log(
+                self.step_id,
+                self.current_task.id if self.current_task else 0,
+                f"Detected platform type: {platform_type} (resolution: {real_width}x{real_height}), scaled {len(scaled_coordinates)} coordinates from SAM",
+                'discovery_platform_detection',
+                None
+            )
+
+            # شناسایی المان‌های ناشناخته و discovery
+            for element_name, coords in scaled_coordinates.items():
+                # فیلتر پلتفرم‌های مختلف - نه فقط desktop
+                platform_elements = ["desktop", "mobile", "tablet", "large_element_segment"]
+                if any(platform in element_name.lower() for platform in platform_elements):
+                    # برای المان‌های پلتفرم، ساختار ساده برگردان
+                    enhanced_coords[element_name] = self.create_platform_element_structure(element_name, coords,
+                                                                                           platform_type)
+                    continue
+
+                # فیلتر کردن detailed analysis از YOLO/SAM (char_, word_, etc.)
+                if any(suffix in element_name for suffix in [
+                    "_char_", "_word_", "_full_text", "_text_content",
+                    "_char_count", "_word_count", "_cursor"
+                ]):
+                    continue
+
+                # پردازش coordinates - پشتیبانی از polygon و rectangle
+                processed_coords = self.process_coordinates(coords, element_name)
+                if not processed_coords:
+                    continue
+
+                # تشخیص اینکه آیا المان نیاز به discovery دارد
+                if self.is_unknown_element(element_name, processed_coords):
+                    try:
+                        discovery_result = self.discover_unknown_element(element_name, processed_coords, image_path)
+
+                        if "error" not in discovery_result:
+                            element_info = discovery_result.get("element_info", {})
+
+                            # بهبود نام المان بر اساس platform type
+                            improved_name = self.generate_improved_element_name_with_platform(element_name,
+                                                                                              element_info,
+                                                                                              platform_type)
+
+                            # ساخت enhanced element با توضیحات کامل
+                            enhanced_element = {
+                                "coordinates": processed_coords,
+                                "original_coordinates": coords,  # نگه داشتن مختصات اصلی
+                                "original_name": element_name,
+                                "improved_name": improved_name,
+                                "element_type": element_info.get("element_type", "unknown"),
+                                "description": element_info.get("description", ""),
+                                "purpose": element_info.get("purpose", ""),
+                                "text_content": element_info.get("text_content", ""),
+                                "is_clickable": element_info.get("is_clickable", False),
+                                "category": element_info.get("category", "unknown"),
+                                "confidence": element_info.get("confidence", 0.5),
+                                "discovery_source": discovery_result.get("source", "unknown"),
+                                "platform_type": platform_type,
+                                "coordinate_type": "polygon" if self.is_polygon_coordinates(coords) else "rectangle",
+                                "scaled_from_sam": True
+                            }
+
+                            # استفاده از نام بهبود یافته به عنوان کلید
+                            enhanced_coords[improved_name] = enhanced_element
+                            discovery_results[element_name] = discovery_result
+
+                            logService.append_log(
+                                self.step_id,
+                                self.current_task.id if self.current_task else 0,
+                                f"Enhanced element '{element_name}' → '{improved_name}': {element_info.get('element_type', 'unknown')} (Platform: {platform_type})",
+                                'discovery_element_enhanced',
+                                discovery_result.get("discovery_image_path")
+                            )
+                        else:
+                            # اگر discovery خطا داشت، المان اصلی را نگه دار
+                            enhanced_coords[element_name] = self.create_fallback_element_structure(element_name,
+                                                                                                   processed_coords,
+                                                                                                   coords,
+                                                                                                   platform_type,
+                                                                                                   "discovery_failed")
+
+                    except Exception as e:
+                        logService.append_log(
+                            self.step_id,
+                            self.current_task.id if self.current_task else 0,
+                            f"Error discovering element '{element_name}': {str(e)}",
+                            'discovery_element_error',
+                            None
+                        )
+                        # در صورت خطا، المان اصلی را نگه دار
+                        enhanced_coords[element_name] = self.create_fallback_element_structure(element_name,
+                                                                                               processed_coords, coords,
+                                                                                               platform_type,
+                                                                                               "discovery_error")
+                else:
+                    # المان شناخته شده - فقط coordinates اضافه کن
+                    enhanced_coords[element_name] = {
+                        "coordinates": processed_coords,
+                        "original_coordinates": coords,
+                        "original_name": element_name,
+                        "improved_name": element_name,
+                        "element_type": self.classify_known_element_type(element_name),
+                        "description": f"Known UI element: {element_name}",
+                        "purpose": "System UI element",
+                        "text_content": "",
+                        "is_clickable": True,
+                        "category": "system_ui",
+                        "confidence": 0.9,
+                        "discovery_source": "known",
+                        "platform_type": platform_type,
+                        "coordinate_type": "polygon" if self.is_polygon_coordinates(coords) else "rectangle",
+                        "scaled_from_sam": True
+                    }
+
+            # WebSocket notification
+            self.websocket_manager.send_to_user_with_format(
+                self.system_user.id,
+                WebSocketType.DISCOVERY_PHASE_COMPLETE,
+                {
+                    'user_id': self.user_id,
+                    'discovered_count': len(discovery_results),
+                    'total_enhanced': len(enhanced_coords),
+                    'platform_type': platform_type,
+                    'for_vision': True
+                }
+            )
+
+            logService.append_log(
+                self.step_id,
+                self.current_task.id if self.current_task else 0,
+                f"Enhanced discovery completed. Platform: {platform_type}, Enhanced {len(enhanced_coords)} elements, discovered {len(discovery_results)} new elements",
+                'discovery_for_vision_complete',
+                None
+            )
+
+            return enhanced_coords
+
+        except Exception as e:
+            logService.append_log(
+                self.step_id,
+                self.current_task.id if self.current_task else 0,
+                f"Error in enhanced discovery for vision: {str(e)}\n{traceback.format_exc()}",
+                'discovery_for_vision_error',
+                None
+            )
+            # در صورت خطا، coordinates اصلی را برگردان
+            return self.filter_coordinates_for_vision(coordinates)
+
+    def scale_sam_coordinates_to_original(self, coordinates: dict, real_width: int, real_height: int) -> dict:
+        """
+        Scale کردن coordinates از سایز مدل SAM به سایز واقعی تصویر
+        """
+        try:
+            # محاسبه سایز مدل SAM (بر اساس کد sam.py)
+            sam_max_size = 1024
+
+            # محاسبه scale factor مدل SAM
+            original_max_dim = max(real_width, real_height)
+            if original_max_dim > sam_max_size:
+                sam_scale_factor = sam_max_size / original_max_dim
+                sam_width = int(real_width * sam_scale_factor)
+                sam_height = int(real_height * sam_scale_factor)
+            else:
+                # اگر تصویر اصلی کوچک‌تر از max_size باشد، scale نشده
+                sam_width = real_width
+                sam_height = real_height
+
+            # محاسبه scale factors برای بازگرداندن به سایز اصلی
+            scale_x = real_width / sam_width
+            scale_y = real_height / sam_height
+
+            logService.append_log(
+                self.step_id,
+                self.current_task.id if self.current_task else 0,
+                f"SAM scaling info: Original({real_width}x{real_height}) -> SAM({sam_width}x{sam_height}) -> Scale factors(x:{scale_x:.3f}, y:{scale_y:.3f})",
+                'sam_coordinate_scaling',
+                None
+            )
+
+            scaled_coordinates = {}
+
+            for element_name, coords in coordinates.items():
+                try:
+                    if self.is_polygon_coordinates(coords):
+                        # Scale polygon coordinates: [[x1, y1], [x2, y2], ...]
+                        scaled_polygon = []
+                        for point in coords:
+                            if len(point) >= 2:
+                                scaled_x = int(point[0] * scale_x)
+                                scaled_y = int(point[1] * scale_y)
+                                # اطمینان از اینکه coordinates در محدوده تصویر باشند
+                                scaled_x = max(0, min(real_width - 1, scaled_x))
+                                scaled_y = max(0, min(real_height - 1, scaled_y))
+                                scaled_polygon.append([scaled_x, scaled_y])
+
+                        if len(scaled_polygon) >= 3:  # حداقل 3 نقطه برای polygon معتبر
+                            scaled_coordinates[element_name] = scaled_polygon
+
+                    elif isinstance(coords, tuple) and len(coords) == 2:
+                        # Scale tuple coordinates: ((x1, y1), (x2, y2))
+                        x1, y1 = coords[0]
+                        x2, y2 = coords[1]
+
+                        scaled_x1 = int(x1 * scale_x)
+                        scaled_y1 = int(y1 * scale_y)
+                        scaled_x2 = int(x2 * scale_x)
+                        scaled_y2 = int(y2 * scale_y)
+
+                        # اطمینان از مختصات معتبر
+                        scaled_x1 = max(0, min(real_width - 1, scaled_x1))
+                        scaled_y1 = max(0, min(real_height - 1, scaled_y1))
+                        scaled_x2 = max(0, min(real_width - 1, scaled_x2))
+                        scaled_y2 = max(0, min(real_height - 1, scaled_y2))
+
+                        scaled_coordinates[element_name] = ((scaled_x1, scaled_y1), (scaled_x2, scaled_y2))
+
+                    elif isinstance(coords, list) and len(coords) == 4:
+                        # Scale rectangle coordinates: [x1, y1, x2, y2]
+                        x1, y1, x2, y2 = coords
+
+                        scaled_x1 = int(x1 * scale_x)
+                        scaled_y1 = int(y1 * scale_y)
+                        scaled_x2 = int(x2 * scale_x)
+                        scaled_y2 = int(y2 * scale_y)
+
+                        # اطمینان از مختصات معتبر
+                        scaled_x1 = max(0, min(real_width - 1, scaled_x1))
+                        scaled_y1 = max(0, min(real_height - 1, scaled_y1))
+                        scaled_x2 = max(0, min(real_width - 1, scaled_x2))
+                        scaled_y2 = max(0, min(real_height - 1, scaled_y2))
+
+                        scaled_coordinates[element_name] = [scaled_x1, scaled_y1, scaled_x2, scaled_y2]
+
+                    else:
+                        # فرمت ناشناخته، coordinate اصلی را نگه دار
+                        scaled_coordinates[element_name] = coords
+
+                except Exception as e:
+                    logService.append_log(
+                        self.step_id,
+                        self.current_task.id if self.current_task else 0,
+                        f"Error scaling coordinates for element '{element_name}': {str(e)}",
+                        'coordinate_scaling_error',
+                        None
+                    )
+                    # در صورت خطا، coordinate اصلی را نگه دار
+                    scaled_coordinates[element_name] = coords
+
+            return scaled_coordinates
+
+        except Exception as e:
+            logService.append_log(
+                self.step_id,
+                self.current_task.id if self.current_task else 0,
+                f"Error in coordinate scaling: {str(e)}",
+                'coordinate_scaling_general_error',
+                None
+            )
+            # در صورت خطا کلی، coordinates اصلی را برگردان
+            return coordinates
+
+    def detect_platform_type(self, width: int, height: int) -> str:
+        """
+        تشخیص نوع platform بر اساس resolution
+        """
+        aspect_ratio = width / height
+
+        # Mobile (Portrait)
+        if width < 800 and aspect_ratio < 1.0:
+            return "mobile_portrait"
+
+        # Mobile (Landscape)
+        elif height < 800 and aspect_ratio > 1.5:
+            return "mobile_landscape"
+
+        # Tablet (Portrait)
+        elif 800 <= width <= 1200 and aspect_ratio < 1.2:
+            return "tablet_portrait"
+
+        # Tablet (Landscape)
+        elif 800 <= height <= 1200 and 1.2 <= aspect_ratio <= 2.0:
+            return "tablet_landscape"
+
+        # Desktop/Large screens
+        elif width >= 1200 or height >= 900:
+            return "desktop"
+
+        # Default
+        return "unknown"
+
+    def is_polygon_coordinates(self, coords) -> bool:
+        """
+        تشخیص اینکه coordinates به صورت polygon هستند یا rectangle
+        """
+        if not isinstance(coords, list):
+            return False
+
+        # اگر اولین element خودش list باشد، polygon است
+        if len(coords) > 0 and isinstance(coords[0], list):
+            return True
+
+        return False
+
+    def process_coordinates(self, coords, element_name: str):
+        """
+        پردازش coordinates - پشتیبانی از polygon و rectangle
+        """
+        try:
+            if self.is_polygon_coordinates(coords):
+                # Polygon format: [[x1, y1], [x2, y2], ...]
+                if len(coords) < 3:  # حداقل 3 نقطه برای polygon
+                    return None
+
+                # محاسبه bounding box از polygon
+                x_coords = [point[0] for point in coords if len(point) >= 2]
+                y_coords = [point[1] for point in coords if len(point) >= 2]
+
+                if not x_coords or not y_coords:
+                    return None
+
+                min_x, max_x = min(x_coords), max(x_coords)
+                min_y, max_y = min(y_coords), max(y_coords)
+
+                # برگرداندن به صورت [x1, y1, x2, y2] برای سازگاری
+                return [int(min_x), int(min_y), int(max_x), int(max_y)]
+
+            else:
+                # Rectangle format: [x1, y1, x2, y2] یا ((x1, y1), (x2, y2))
+                if isinstance(coords, tuple) and len(coords) == 2:
+                    # ((x1, y1), (x2, y2)) format
+                    return [int(coords[0][0]), int(coords[0][1]), int(coords[1][0]), int(coords[1][1])]
+                elif isinstance(coords, list) and len(coords) == 4:
+                    # [x1, y1, x2, y2] format
+                    return [int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])]
+                else:
+                    return None
+
+        except (ValueError, TypeError, IndexError):
+            return None
+
+    def create_platform_element_structure(self, element_name: str, coords, platform_type: str) -> dict:
+        """
+        ایجاد ساختار برای المان‌های platform
+        """
+        processed_coords = self.process_coordinates(coords, element_name)
+        return {
+            "coordinates": processed_coords if processed_coords else coords,
+            "original_coordinates": coords,
+            "original_name": element_name,
+            "improved_name": f"{platform_type}_{element_name}",
+            "element_type": "platform_background",
+            "description": f"Platform background element for {platform_type}",
+            "purpose": "Background/container element",
+            "text_content": "",
+            "is_clickable": False,
+            "category": "platform",
+            "confidence": 1.0,
+            "discovery_source": "platform_detection",
+            "platform_type": platform_type,
+            "coordinate_type": "polygon" if self.is_polygon_coordinates(coords) else "rectangle"
+        }
+
+    def create_fallback_element_structure(self, element_name: str, processed_coords, original_coords,
+                                          platform_type: str, error_type: str) -> dict:
+        """
+        ایجاد ساختار fallback برای المان‌هایی که discovery شان خطا داشته
+        """
+        return {
+            "coordinates": processed_coords,
+            "original_coordinates": original_coords,
+            "original_name": element_name,
+            "improved_name": element_name,
+            "element_type": "unknown",
+            "description": f"Element discovery failed: {error_type}",
+            "purpose": "Unknown element",
+            "text_content": "",
+            "is_clickable": False,
+            "category": "unknown",
+            "confidence": 0.1,
+            "discovery_source": error_type,
+            "platform_type": platform_type,
+            "coordinate_type": "polygon" if self.is_polygon_coordinates(original_coords) else "rectangle"
+        }
+
+    def generate_improved_element_name_with_platform(self, element_name: str, element_info: dict,
+                                                     platform_type: str) -> str:
+        """
+        بهبود نام المان با در نظر گیری platform type
+        """
+        base_name = self.generate_improved_element_name(element_name, element_info)
+        element_type = element_info.get("element_type", "unknown")
+
+        # اضافه کردن prefix platform برای بهتر شدن نام‌گذاری
+        if element_type in ["button", "icon", "menu", "file", "folder"]:
+            return f"{platform_type}_{base_name}"
+
+        return base_name
+
+    def classify_known_element_type(self, element_name: str) -> str:
+        """
+        طبقه‌بندی المان‌های شناخته شده بر اساس نام
+        """
+        element_name_lower = element_name.lower()
+
+        if 'desktop' in element_name_lower:
+            return 'desktop'
+        elif 'browser' in element_name_lower or 'firefox' in element_name_lower:
+            return 'browser'
+        elif 'terminal' in element_name_lower:
+            return 'terminal'
+        elif 'button' in element_name_lower:
+            return 'button'
+        elif 'icon' in element_name_lower:
+            return 'icon'
+        elif 'window' in element_name_lower:
+            return 'window'
+        elif 'menu' in element_name_lower:
+            return 'menu'
+        elif 'clock' in element_name_lower or 'time' in element_name_lower:
+            return 'clock'
+        elif 'taskbar' in element_name_lower:
+            return 'taskbar'
+        else:
+            return 'ui_element'
+
+    def getCoordinatesFromDetector(self):
+        """
+        استفاده از detector script در container برای دریافت اطلاعات المان‌های UI
+        """
+        try:
+            CommandService.run_command_via_container(
+                'gsettings set org.gnome.desktop.interface toolkit-accessibility true', self.user_id)
+            CommandService.run_command_via_container('export XAUTHORITY=/home/ubuntu/.Xauthority', self.user_id)
+            output = CommandService.run_command_via_container("python3 /root/Desktop/orchestrator/detector.py",
+                                                              self.user_id)
+
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f'Detector script output: {output}',
+                                  'detector_script_output',
+                                  None)
+
+            if output and isinstance(output, str):
+                idx = output.find("{")
+                output = output[idx:]
+                detector_data = json.loads(output.strip())
+                logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                      f'Processed {len(detector_data)} elements from detector',
+                                      'detector_processing_complete',
+                                      None)
+
+                return json.dumps(detector_data, ensure_ascii=False)
+            else:
+                logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                      f'Invalid detector output: {output}',
+                                      'detector_error',
+                                      None)
+                raise Exception("Invalid detector output")
+
+        except json.JSONDecodeError as e:
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f'JSON parse error from detector: {str(e)}',
+                                  'detector_json_error',
+                                  None)
+            raise e
+
+        except Exception as e:
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f'Error running detector: {str(e)}',
+                                  'detector_script_error',
+                                  None)
+            raise e
+
+
+
+
+
+    def draw_rectangles_on_image(self, input_image_path, data, output_image_path=None):
+        """
+        روی عکس ورودی rectangle های رنگی برای applications و elements رسم می‌کند
+        بر اساس ساختار داده جدید
+        """
+        try:
+            # باز کردن عکس
+            if isinstance(input_image_path, str):
+                img = Image.open(input_image_path)
+            else:
+                img = input_image_path.copy()
+
+            # ایجاد شیء Draw
+            draw = ImageDraw.Draw(img)
+
+            # خواندن ابعاد واقعی عکس
+            real_width, real_height = self.get_image_dimensions(input_image_path)
+
+            detail = {}
+            drawn_count = 0
+
+            # تعریف رنگ‌ها برای انواع مختلف
+            colors = {
+                "application": "blue",        # اپلیکیشن - آبی
+                "interactive": "red",         # المان‌های تعاملی - قرمز
+                "frame": "lime",              # فریم - سبز روشن
+                "panel": "green",             # پنل‌ها - سبز
+                "menu_bar": "purple",         # منو بار - بنفش
+                "tool_bar": "cyan",           # تول بار - فیروزه‌ای
+                "filler": "yellow",           # فیلر - زرد
+                "element": "orange",          # المان‌های عادی - نارنجی
+                "unknown": "gray"             # المان‌های ناشناخته - خاکستری
+            }
+
+            # دریافت اطلاعات desktop
+            desktop_info = data.get("desktop_info", {})
+            active_window_id = desktop_info.get("active_window_id", "")
+            screen_resolution = desktop_info.get("screen_resolution", {})
+            
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f'Drawing rectangles for screen resolution: {screen_resolution}, active window: {active_window_id}',
+                                  'draw_rectangles_start',
+                                  None)
+
+            # بررسی اینکه داده شامل applications است
+            if "applications" in data:
+                applications = data["applications"]
+                
+                for app_idx, application in enumerate(applications):
+                    try:
+                        app_name = application.get("app_name", "unknown")
+                        elements = application.get("elements", [])
+                        element_count = application.get("element_count", 0)
+                        interactive_count = application.get("interactive_count", 0)
+                        window_info = application.get("window_info", {})
+
+                        # رسم window اصلی اگر window_info موجود باشد
+                        if window_info and "bounds" in window_info:
+                            bounds = window_info["bounds"]
+                            window_title = window_info.get("title", "")
+                            layer = window_info.get("layer", 0)
+                            
+                            x = bounds.get("x", 0)
+                            y = bounds.get("y", 0)
+                            width = bounds.get("width", 0)
+                            height = bounds.get("height", 0)
+                            
+                            x1, y1 = x, y
+                            x2, y2 = x + width, y + height
+
+                            # اطمینان از اینکه مختصات در محدوده تصویر هستند
+                            x1 = max(0, min(real_width - 1, x1))
+                            y1 = max(0, min(real_height - 1, y1))
+                            x2 = max(0, min(real_width, x2))
+                            y2 = max(0, min(real_height, y2))
+
+                            if x2 > x1 and y2 > y1:
+                                # رسم مستطیل اپلیکیشن
+                                color = colors["application"]
+                                line_width = 3
+                                
+                                draw.rectangle([(x1, y1), (x2, y2)], outline=color, width=line_width)
+                                
+                                # اضافه کردن نام اپلیکیشن و اطلاعات
+                                display_name = f"{app_name}"
+                                if window_title and window_title != app_name:
+                                    display_name += f"_{window_title}"
+                                display_name = display_name[:30]  # محدود کردن طول نام
+                                
+                                # اضافه کردن تعداد elements
+                                info_text = f"{display_name} ({element_count}e/{interactive_count}i)"
+                                draw.text((x1 + 5, y1 + 5), info_text, fill=color)
+                                
+                                detail[f"{app_name}_application_{app_idx}"] = {
+                                    "coords": [x1, y1, x2, y2],
+                                    "center_point": [(x1 + x2) // 2, (y1 + y2) // 2],
+                                    "app_name": app_name,
+                                    "title": window_title,
+                                    "layer": layer,
+                                    "element_count": element_count,
+                                    "interactive_count": interactive_count
+                                }
+                                drawn_count += 1
+
+                        # رسم elements داخل اپلیکیشن
+                        for elem_idx, element in enumerate(elements):
+                            try:
+                                # استخراج اطلاعات element با ساختار جدید
+                                position = element.get("position", [0, 0])
+                                size = element.get("size", [0, 0])
+                                center = element.get("center", [0, 0])
+                                depth = element.get("depth", 1)
+                                layer = element.get("layer", 1)
+                                is_interactive = element.get("is_interactive", False)
+                                visible = element.get("visible", True)
+                                name = element.get("name", "")
+                                role = element.get("role", "unknown")
+                                window_title = element.get("window_title", "")
+                                
+                                # محاسبه مختصات از position و size
+                                elem_x, elem_y = position[0], position[1]
+                                elem_width, elem_height = size[0], size[1]
+                                center_x, center_y = center[0], center[1]
+                                
+                                if elem_width > 2 and elem_height > 2 and visible:  # فقط elements قابل مشاهده و با اندازه مناسب
+                                    ex1, ey1 = elem_x, elem_y
+                                    ex2, ey2 = elem_x + elem_width, elem_y + elem_height
+
+                                    # اطمینان از محدوده تصویر
+                                    ex1 = max(0, min(real_width - 1, ex1))
+                                    ey1 = max(0, min(real_height - 1, ey1))
+                                    ex2 = max(0, min(real_width, ex2))
+                                    ey2 = max(0, min(real_height, ey2))
+
+                                    if ex2 > ex1 and ey2 > ey1:
+                                        # تعیین رنگ بر اساس role و interactive بودن
+                                        if is_interactive:
+                                            elem_color = colors["interactive"]
+                                            elem_width_line = 3
+                                        elif role == "frame":
+                                            elem_color = colors["frame"]
+                                            elem_width_line = 2
+                                        elif role == "panel":
+                                            elem_color = colors["panel"]
+                                            elem_width_line = 1
+                                        elif role == "menu bar":
+                                            elem_color = colors["menu_bar"]
+                                            elem_width_line = 2
+                                        elif role == "tool bar":
+                                            elem_color = colors["tool_bar"]
+                                            elem_width_line = 2
+                                        elif role == "filler":
+                                            elem_color = colors["filler"]
+                                            elem_width_line = 1
+                                        elif role == "unknown":
+                                            elem_color = colors["unknown"]
+                                            elem_width_line = 1
+                                        else:
+                                            elem_color = colors["element"]
+                                            elem_width_line = 1
+                                        
+                                        # رسم مستطیل element
+                                        draw.rectangle([(ex1, ey1), (ex2, ey2)], outline=elem_color, width=elem_width_line)
+                                        
+                                        # رسم نقطه مرکزی برای elements تعاملی یا مهم
+                                        if is_interactive or role == "frame":
+                                            # اطمینان از اینکه center در محدوده تصویر است
+                                            center_x_bounded = max(0, min(real_width - 1, center_x))
+                                            center_y_bounded = max(0, min(real_height - 1, center_y))
+                                            
+                                            # رسم دایره کوچک در مرکز
+                                            circle_size = 4 if is_interactive else 2
+                                            draw.ellipse([
+                                                center_x_bounded - circle_size, center_y_bounded - circle_size,
+                                                center_x_bounded + circle_size, center_y_bounded + circle_size
+                                            ], fill=elem_color)
+                                        
+                                        # اضافه کردن نام element اگر وجود دارد و مهم است
+                                        if name and len(name.strip()) > 0 and (is_interactive or role == "frame"):
+                                            name_text = name[:20]  # محدود کردن طول نام
+                                            # محاسبه موقعیت متن تا از مرز خارج نشود
+                                            text_x = min(ex1 + 2, real_width - 100)
+                                            text_y = min(ey1 + 2, real_height - 20)
+                                            draw.text((text_x, text_y), name_text, fill=elem_color)
+                                        
+                                        detail[f"{app_name}_element_{elem_idx}"] = {
+                                            "coords": [ex1, ey1, ex2, ey2],
+                                            "center_point": [center_x, center_y],
+                                            "position": position,
+                                            "size": size,
+                                            "role": role,
+                                            "name": name,
+                                            "depth": depth,
+                                            "layer": layer,
+                                            "is_interactive": is_interactive,
+                                            "visible": visible,
+                                            "window_title": window_title,
+                                            "app_name": app_name
+                                        }
+                                        drawn_count += 1
+
+                            except Exception as e:
+                                logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                                      f'Error drawing element {elem_idx} in application {app_name}: {str(e)}',
+                                                      'draw_element_error',
+                                                      None)
+                                continue
+
+                    except Exception as e:
+                        logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                              f'Error drawing application {app_idx}: {str(e)}',
+                                              'draw_application_error',
+                                              None)
+                        continue
+
+            # اضافه کردن اطلاعات summary به detail
+            summary = data.get("summary", {})
+            detail["summary"] = {
+                "total_applications": summary.get("total_applications", 0),
+                "total_elements": summary.get("total_elements", 0),
+                "total_interactive_elements": summary.get("total_interactive_elements", 0),
+                "drawn_rectangles": drawn_count,
+                "screen_resolution": screen_resolution,
+                "active_window_id": active_window_id
+            }
+
+            # ذخیره یا نمایش
+            if output_image_path:
+                os.makedirs(os.path.dirname(output_image_path), exist_ok=True)
+                img.save(output_image_path)
+
+                logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                      f'Successfully drew {drawn_count} rectangles on image. Applications: {summary.get("total_applications", 0)}, Elements: {summary.get("total_elements", 0)}, Interactive: {summary.get("total_interactive_elements", 0)}. Saved to: {output_image_path}',
+                                      'draw_rectangles_complete',
+                                      output_image_path)
+            else:
+                img.show()
+
+            return detail
+
+        except Exception as e:
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f'Error in draw_rectangles_on_image: {str(e)}',
+                                  'draw_rectangles_error',
+                                  None)
+            return {}
+
+
+
+    def prefilter_detector_data(self, detector_data: dict, task_description: str = "") -> dict:
+        """
+        Pre-filter detector data to reduce size before compression
+        Focus on interactive elements and elements relevant to task
+        """
+        try:
+            filtered_data = {
+                'desktop_info': detector_data.get('desktop_info', {}),
+                'applications': [],
+                'summary': {}
+            }
+            
+            active_window_id = detector_data.get('desktop_info', {}).get('active_window_id', '')
+            task_lower = task_description.lower()
+            
+            # Keywords for relevance check
+            task_keywords = set(task_lower.split())
+            
+            for app in detector_data.get('applications', []):
+                app_name = app.get('app_name', '').lower()
+                window_info = app.get('window_info', {})
+                window_title = window_info.get('title', '').lower()
+                
+                # Check if this is the active window
+                is_active_window = (window_info.get('bounds', {}) and 
+                                   active_window_id != '')
+                
+                # Check if app/window is relevant to task
+                is_relevant = (
+                    any(keyword in app_name for keyword in task_keywords if len(keyword) > 2) or
+                    any(keyword in window_title for keyword in task_keywords if len(keyword) > 2) or
+                    is_active_window or
+                    'caja' in app_name  # Always include file manager (desktop icons)
+                )
+                
+                if not is_relevant:
+                    continue
+                
+                filtered_elements = []
+                for element in app.get('elements', []):
+                    element_name = element.get('name', '').lower()
+                    element_role = element.get('role', '').lower()
+                    is_interactive = element.get('is_interactive', False)
+                    
+                    # Include element if:
+                    # 1. Interactive
+                    # 2. Has meaningful name relevant to task
+                    # 3. Important roles (frame, icon, button, entry, menu)
+                    # 4. From active window
+                    should_include = (
+                        is_interactive or
+                        element_role in ['frame', 'icon', 'button', 'push button', 'entry', 'menu', 'menu item', 'text'] or
+                        any(keyword in element_name for keyword in task_keywords if len(keyword) > 2) or
+                        (is_active_window and element_role not in ['filler', 'panel', 'scroll pane'])
+                    )
+                    
+                    if should_include:
+                        # Simplify element data - keep only essential fields
+                        filtered_element = {
+                            'name': element.get('name', ''),
+                            'role': element_role,
+                            'position': element.get('position', [0, 0]),
+                            'size': element.get('size', [0, 0]),
+                            'center': element.get('center', [0, 0]),
+                            'is_interactive': is_interactive,
+                            'window_title': element.get('window_title', '')
+                        }
+                        filtered_elements.append(filtered_element)
+                
+                if filtered_elements:
+                    filtered_app = {
+                        'app_name': app.get('app_name', ''),
+                        'elements': filtered_elements,
+                        'element_count': len(filtered_elements),
+                        'interactive_count': len([e for e in filtered_elements if e.get('is_interactive', False)]),
+                        'window_info': window_info
+                    }
+                    filtered_data['applications'].append(filtered_app)
+            
+            # Update summary
+            total_elements = sum(app['element_count'] for app in filtered_data['applications'])
+            total_interactive = sum(app.get('interactive_count', 0) for app in filtered_data['applications'])
+            
+            filtered_data['summary'] = {
+                'total_applications': len(filtered_data['applications']),
+                'total_elements': total_elements,
+                'total_interactive_elements': total_interactive
+            }
+            
+            # Log filtering results
+            original_apps = len(detector_data.get('applications', []))
+            original_elements = sum(app.get('element_count', 0) for app in detector_data.get('applications', []))
+            filtered_apps = len(filtered_data['applications'])
+            filtered_elements = total_elements
+            
+            reduction_ratio = round((1 - filtered_elements / max(original_elements, 1)) * 100, 1)
+            
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f"Pre-filtered detector data: {original_apps} apps ({original_elements} elements) -> {filtered_apps} apps ({filtered_elements} elements) - {reduction_ratio}% reduction",
+                                  "detector_prefiltering",
+                                  None)
+            
+            return filtered_data
+            
+        except Exception as e:
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f"Error in prefilter_detector_data: {str(e)}. Using original data.",
+                                  "prefiltering_error",
+                                  None)
+            return detector_data
+
+    def create_coordinate_summary(self, compressed_json: str) -> str:
+        """
+        Create human-readable summary from compressed coordinates
+        """
+        try:
+            data = json.loads(compressed_json)
+            
+            summary_lines = []
+            summary_lines.append(f"Screen: {data.get('screen', {}).get('width', 0)}x{data.get('screen', {}).get('height', 0)}")
+            
+            # Active window summary
+            active = data.get('active_window')
+            if active:
+                summary_lines.append(f"\nActive Window: {active.get('title', active.get('app', 'Unknown'))}")
+                interactive_count = sum(1 for e in active.get('elements', []) if e.get('i', False))
+                summary_lines.append(f"  - {len(active.get('elements', []))} elements ({interactive_count} interactive)")
+                
+                # List key interactive elements
+                for elem in active.get('elements', [])[:10]:  # Max 10 elements
+                    if elem.get('i') or elem.get('n'):
+                        name = elem.get('n', 'unnamed')
+                        role = elem.get('r', 'unknown')
+                        center = elem.get('c', [0, 0])
+                        summary_lines.append(f"    • {name} ({role}) at center {center}")
+            
+            # Other windows summary (only if interactive)
+            other_windows = data.get('windows', [])
+            if other_windows:
+                summary_lines.append(f"\nOther Windows ({len(other_windows)}):")
+                for window in other_windows[:3]:  # Max 3 windows
+                    interactive_count = sum(1 for e in window.get('elements', []) if e.get('i', False))
+                    if interactive_count > 0:
+                        summary_lines.append(f"  - {window.get('title', window.get('app', 'Unknown'))}: {interactive_count} interactive elements")
+            
+            return '\n'.join(summary_lines)
+            
+        except Exception as e:
+            return f"Coordinate data available (parsing error: {str(e)[:50]})"
+
+    def _process_outcome_validation(self, vision_response: str):
+        """
+        پردازش outcome validation از vision response و ذخیره mistake در صورت لزوم
+        """
+        try:
+            # اگر اطلاعات last action وجود نداشت، چیزی برای validate کردن نیست
+            if not self.last_action_info or not self.last_action_info.get('expected_outcome'):
+                return
+            
+            response_lower = vision_response.lower()
+            
+            # تشخیص outcome_validation از response
+            # جستجوی کلمات کلیدی که نشان دهنده validation منفی هستند
+            negative_indicators = [
+                'outcome_validation: no',
+                'outcome_validation: partially',
+                'outcome_validation:no',
+                'outcome_validation:partially',
+                'did the expected outcome happen? no',
+                'did the expected outcome happen? partially',
+                'expected outcome: no',
+                'validation: no',
+                'validation: partially',
+                'needs_correction: yes',
+                'needs_correction:yes',
+                'unexpected',
+                'wrong page',
+                'wrong window',
+                'wrong tab',
+                'unwanted tab',
+                'unwanted window',
+                'new tab opened',
+                'blank tab',
+                'opened password',
+                'opened passwords',
+                'password manager',
+                'passwords — mozilla firefox',
+                'mozilla firefox password'
+            ]
+            
+            is_negative = any(indicator in response_lower for indicator in negative_indicators)
+            
+            if is_negative:
+                # استخراج actual_outcome از response
+                actual_outcome = self._extract_actual_outcome(vision_response)
+                
+                # استخراج window title از vision response (اگر موجود باشد)
+                window_title_after = self._extract_window_title(vision_response)
+                
+                # ساخت action_context برای ذخیره mistake
+                action_context = {
+                    'action_type': self.last_action_info.get('action_type', 'unknown'),
+                    'coordinates': self.last_action_info.get('coordinates'),
+                    'window_title_after': window_title_after,
+                    'timestamp': self.last_action_info.get('timestamp')
+                }
+                
+                # استخراج suggested_solution از response (اگر وجود داشت)
+                suggested_solution = self._extract_corrective_action(vision_response)
+                
+                # ذخیره mistake
+                mistake_id = self.shared_learning.save_mistake(
+                    action_context=action_context,
+                    expected_outcome=self.last_action_info.get('expected_outcome', ''),
+                    actual_outcome=actual_outcome,
+                    problem_description=f"Action {action_context['action_type']} did not produce expected outcome",
+                    suggested_solution=suggested_solution
+                )
+                
+                print(f"✗ Mistake detected and saved: {mistake_id}")
+                print(f"  Expected: {self.last_action_info.get('expected_outcome')}")
+                print(f"  Actual: {actual_outcome}")
+                
+                # لاگ کردن mistake
+                logService.append_log(
+                    self.step_id, 
+                    self.current_task.id if self.current_task else 0,
+                    f"Mistake detected - ID: {mistake_id}, Expected: {self.last_action_info.get('expected_outcome')}, Actual: {actual_outcome}",
+                    'mistake_detected',
+                    None
+                )
+            else:
+                print(f"✓ Action outcome validated successfully")
+                
+        except Exception as e:
+            print(f"Error in outcome validation processing: {e}")
+            traceback.print_exc()
+    
+    def _extract_actual_outcome(self, vision_response: str) -> str:
+        """استخراج actual_outcome از vision response"""
+        # جستجوی patterns مختلف برای actual outcome
+        patterns = [
+            r'actual_outcome:\s*(.+?)(?:\n|$)',
+            r'actually happened:\s*(.+?)(?:\n|$)',
+            r'what actually happened:\s*(.+?)(?:\n|$)',
+            r'instead:\s*(.+?)(?:\n|$)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, vision_response, re.IGNORECASE | re.MULTILINE)
+            if match:
+                return match.group(1).strip()
+        
+        # اگر pattern پیدا نشد، سعی کن از context استنباط کنی
+        response_lower = vision_response.lower()
+        
+        if 'password' in response_lower and 'manager' in response_lower:
+            return "Password manager page opened instead of expected action"
+        elif 'new tab' in response_lower:
+            return "New tab opened unexpectedly"
+        elif 'blank' in response_lower and 'tab' in response_lower:
+            return "Blank tab opened instead of expected action"
+        elif 'tab' in response_lower and ('opened' in response_lower or 'unexpected' in response_lower):
+            return "Unexpected tab opened"
+        elif 'wrong' in response_lower and ('page' in response_lower or 'window' in response_lower):
+            return "Wrong page/window displayed"
+        
+        return "Unexpected outcome occurred"
+    
+    def _extract_window_title(self, vision_response: str) -> str:
+        """استخراج window title از vision response"""
+        # جستجوی patterns برای window title
+        patterns = [
+            r'active window:\s*["\']?([^"\'\n]+)["\']?',
+            r'window:\s*["\']?([^"\'\n]+)["\']?',
+            r'title:\s*["\']?([^"\'\n]+)["\']?'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, vision_response, re.IGNORECASE)
+            if match:
+                title = match.group(1).strip()
+                if len(title) > 5:  # حداقل طول معقول
+                    return title
+        
+        return "Unknown"
+    
+    def _extract_corrective_action(self, vision_response: str) -> str:
+        """استخراج corrective action از vision response"""
+        # جستجوی patterns برای solution
+        patterns = [
+            r'corrective action[s]?:\s*(.+?)(?:\n\n|$)',
+            r'solution:\s*(.+?)(?:\n\n|$)',
+            r'to fix:\s*(.+?)(?:\n\n|$)',
+            r'should:\s*(.+?)(?:\n\n|$)',
+            r'first action.*?:\s*(.+?)(?:\n|$)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, vision_response, re.IGNORECASE | re.DOTALL)
+            if match:
+                solution = match.group(1).strip()[:200]
+                if solution and len(solution) > 10:  # حداقل طول معقول
+                    return solution
+        
+        # راه‌حل‌های پیش‌فرض بر اساس context و window title
+        response_lower = vision_response.lower()
+        
+        # Firefox password manager
+        if 'password' in response_lower and ('manager' in response_lower or 'firefox' in response_lower):
+            return "Close password manager tab using send_key(['Control_L', 'w']) and return to login page"
+        
+        # New Tab opened
+        if 'new tab' in response_lower or 'blank tab' in response_lower:
+            return "Close new tab using send_key(['Control_L', 'w']) to return to previous page"
+        
+        # Generic unexpected tab/window
+        if ('tab' in response_lower or 'window' in response_lower) and ('unexpected' in response_lower or 'wrong' in response_lower or 'opened' in response_lower):
+            return "Close unwanted tab/window using send_key(['Control_L', 'w'])"
+        
+        # Popup or dialog
+        if 'popup' in response_lower or 'dialog' in response_lower or 'modal' in response_lower:
+            return "Dismiss popup using send_key(['Escape'])"
+        
+        # Wrong page loaded
+        if 'wrong page' in response_lower or 'incorrect page' in response_lower:
+            return "Click on correct browser tab to switch back, or use send_key(['Alt_L', 'Left']) to go back"
+        
+        return "Review situation and use appropriate corrective action (close tab, dismiss popup, or switch tab)"
+
+    def compress_coordinates_for_vision(self, detector_coordinates: dict, task_description: str = "") -> str:
+        """
+        Compress detector coordinates to a minimal structured format for vision model
+        Already pre-filtered data, now create human-readable compact summary
+        """
+        try:
+            # Build compact summary structure
+            compressed = {
+                'screen': detector_coordinates.get('desktop_info', {}).get('screen_resolution', {}),
+                'active_window': None,
+                'windows': []
+            }
+            
+            active_window_id = detector_coordinates.get('desktop_info', {}).get('active_window_id', '')
+            
+            for app in detector_coordinates.get('applications', []):
+                window_info = app.get('window_info', {})
+                
+                # Create window summary
+                window_summary = {
+                    'app': app.get('app_name', ''),
+                    'title': window_info.get('title', ''),
+                    'bounds': window_info.get('bounds', {}),
+                    'elements': []
+                }
+                
+                # Add compact element info
+                for element in app.get('elements', []):
+                    # Create ultra-compact element representation
+                    elem_compact = {
+                        'n': element.get('name', '')[:30],  # name (truncated)
+                        'r': element.get('role', ''),  # role
+                        'p': element.get('position', []),  # position
+                        's': element.get('size', []),  # size
+                        'c': element.get('center', []),  # center
+                        'i': element.get('is_interactive', False)  # interactive
+                    }
+                    
+                    # Only include if has useful info
+                    if elem_compact['n'] or elem_compact['i']:
+                        window_summary['elements'].append(elem_compact)
+                
+                # Determine if this is active window
+                is_active = (window_info.get('layer', 0) == 0 or 
+                           'active' in window_info.get('title', '').lower())
+                
+                if is_active and not compressed['active_window']:
+                    compressed['active_window'] = window_summary
+                else:
+                    # Only add if has interactive elements
+                    if any(e['i'] for e in window_summary['elements']):
+                        compressed['windows'].append(window_summary)
+            
+            # Convert to compact JSON string
+            compressed_str = json.dumps(compressed, separators=(',', ':'), ensure_ascii=False)
+            
+            # Log compression results
+            original_size = len(json.dumps(detector_coordinates))
+            compressed_size = len(compressed_str)
+            compression_ratio = round((1 - compressed_size / original_size) * 100, 1)
+            
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f"Compressed coordinates: {original_size} -> {compressed_size} chars ({compression_ratio}% reduction)",
+                                  "coordinates_compression",
+                                  None)
+            
+            return compressed_str
+            
+        except Exception as e:
+            logService.append_log(self.step_id, self.current_task.id if self.current_task else 0,
+                                  f"Error compressing coordinates: {str(e)}. Using simplified fallback.",
+                                  "compression_error",
+                                  None)
+            # Fallback: ultra-minimal format
+            return json.dumps({
+                'apps': [app.get('app_name', '') for app in detector_coordinates.get('applications', [])]
+            }, separators=(',', ':'))
 

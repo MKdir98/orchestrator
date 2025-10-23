@@ -54,7 +54,7 @@ app.config['JWT_SECRET_KEY'] = os.getenv("JWT_SECRET_KEY")
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
 jwt = JWTManager(app)
 
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 
 # socketio.init_app(app, cors_allowed_origins="*", logger=True,
@@ -72,19 +72,20 @@ def handle_connect():
     db = SessionLocal()
     token = request.args.get('token')
     if not token:
-        print("No token provided")
         return False
     try:
         decoded_token = decode_token(token)
         user_id = int(decoded_token.get('sub'))
         system_user = db.query(SystemUser).filter(SystemUser.id == user_id).first()
         if system_user:
+            # Join user to their own room (using SID as room name)
+            join_room(request.sid)
+            
             websocket_manager.add_connection(system_user.id, request.sid)
             websocket_manager.send_to_user_with_format(system_user.id, WebSocketType.PING, {
                 'system_user_id': system_user.id
             })
         else:
-            print("User not found")
             return False
     except Exception as e:
         print(f"Token verification failed: {e}")
@@ -96,7 +97,6 @@ def handle_disconnect():
     user_id = request.args.get('user_id')
     if user_id:
         websocket_manager.remove_connection(user_id)
-        print(f"User {user_id} disconnected")
 
 
 @app.errorhandler(Exception)
@@ -311,7 +311,25 @@ def get_log_image(filename):
 def get_task_logs(task_id):
     try:
         db = SessionLocal()
-        step_logs = logService.get_logs_by_task_step(task_id, get_current_user(db), True)
+        
+        # دریافت query parameters
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 50, type=int)
+        log_types_str = request.args.get('types', None)
+        
+        # پارس کردن log types (comma separated)
+        log_types = None
+        if log_types_str:
+            log_types = [t.strip() for t in log_types_str.split(',') if t.strip()]
+        
+        step_logs = logService.get_logs_by_task_step(
+            task_id, 
+            get_current_user(db), 
+            include_images=True,
+            page=page,
+            per_page=per_page,
+            log_types=log_types
+        )
         return jsonify(step_logs)
     except Exception as e:
         raise e
@@ -334,12 +352,29 @@ def get_task_logs(task_id):
 
 def create_app():
     # init_db()
+    
+    # Reset all in_progress users to IDLE on startup
+    db = SessionLocal()
+    try:
+        in_progress_users = db.query(User).filter(User.status == "IN_PROGRESS").all()
+        for user in in_progress_users:
+            user.status = "IDLE"
+        db.commit()
+        if in_progress_users:
+            print(f"Reset {len(in_progress_users)} user(s) from IN_PROGRESS to IDLE on startup")
+    except Exception as e:
+        print(f"Error resetting user statuses on startup: {e}")
+        db.rollback()
+    finally:
+        db.close()
+    
     scheduler = BackgroundScheduler()
     chatService = ChatService()
     scheduler.add_job(func=check_and_create_containers, trigger="interval", minutes=1)
     scheduler.add_job(func=chatService.check_and_create_users_in_chat, trigger="interval", minutes=1)
     scheduler.start()
     websocket_manager.socketio = socketio
+    websocket_manager.app = app
     return app
 
 
@@ -349,5 +384,4 @@ def main():
     # sock = Sock(app)
 
 
-if __name__ == 'app':
-    main()
+main()

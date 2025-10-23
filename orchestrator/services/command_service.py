@@ -4,8 +4,10 @@ from orchestrator.models.task import Task
 from orchestrator.models.user import User
 from orchestrator.services.container_service import ContainerService
 from sqlalchemy.orm import Session
-import asyncio, asyncvnc
+import asyncio
+import asyncvnc
 from PIL import Image
+import time
 
 from orchestrator.services.data_service import DataService
 
@@ -127,8 +129,11 @@ class CommandService:
             raise ValueError(f"User with ID {current_user_id} not found.")
 
         async def async_typing():
+            # Small delay to avoid conflicts
+            await asyncio.sleep(0.1)
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 client.keyboard.write(text)
+                await asyncio.sleep(0.1)
 
         asyncio.run(async_typing())
 
@@ -141,9 +146,11 @@ class CommandService:
             raise ValueError(f"User with ID {current_user_id} not found.")
 
         async def async_click():
+            await asyncio.sleep(0.1)
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 client.mouse.move(int(x), int(y))
                 client.mouse.click()
+                await asyncio.sleep(0.1)
 
         asyncio.run(async_click())
 
@@ -155,11 +162,13 @@ class CommandService:
         if not user:
             raise ValueError(f"User with ID {current_user_id} not found.")
 
-        async def async_click():
+        async def async_scroll():
+            await asyncio.sleep(0.1)
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 client.mouse.scroll_up(repeat)
+                await asyncio.sleep(0.1)
 
-        asyncio.run(async_click())
+        asyncio.run(async_scroll())
 
     @staticmethod
     def scroll_down(repeat, current_user_id: int):
@@ -169,11 +178,13 @@ class CommandService:
         if not user:
             raise ValueError(f"User with ID {current_user_id} not found.")
 
-        async def async_click():
+        async def async_scroll():
+            await asyncio.sleep(0.1)
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 client.mouse.scroll_down(repeat)
+                await asyncio.sleep(0.1)
 
-        asyncio.run(async_click())
+        asyncio.run(async_scroll())
 
     @staticmethod
     def double_click(x, y, current_user_id: int):
@@ -183,13 +194,15 @@ class CommandService:
         if not user:
             raise ValueError(f"User with ID {current_user_id} not found.")
 
-        async def async_click():
+        async def async_double_click():
+            await asyncio.sleep(0.1)
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 client.mouse.move(int(x), int(y))
                 client.mouse.click()
                 client.mouse.click()
+                await asyncio.sleep(0.1)
 
-        asyncio.run(async_click())
+        asyncio.run(async_double_click())
 
     @staticmethod
     def right_click(x, y, current_user_id: int):
@@ -199,12 +212,14 @@ class CommandService:
         if not user:
             raise ValueError(f"User with ID {current_user_id} not found.")
 
-        async def async_click():
+        async def async_right_click():
+            await asyncio.sleep(0.1)
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 client.mouse.move(int(x), int(y))
                 client.mouse.right_click()
+                await asyncio.sleep(0.1)
 
-        asyncio.run(async_click())
+        asyncio.run(async_right_click())
 
     @staticmethod
     def move_mouse(x, y, current_user_id: int):
@@ -214,25 +229,43 @@ class CommandService:
         if not user:
             raise ValueError(f"User with ID {current_user_id} not found.")
 
-        async def async_click():
+        async def async_move():
+            await asyncio.sleep(0.1)
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 client.mouse.move(int(x), int(y))
+                await asyncio.sleep(0.05)
 
-        asyncio.run(async_click())
+        asyncio.run(async_move())
 
     @staticmethod
-    def send_key(name, current_user_id: int):
+    def send_key(keys, current_user_id: int):
+        """
+        Send keyboard keys via VNC.
+        
+        Args:
+            keys: List of keys to press (e.g., ['Control_L', 'l'] for Ctrl+L, or ['Enter'] for single key)
+            current_user_id: User ID
+        """
         db = SessionLocal()
 
         user = db.query(User).filter(User.id == current_user_id).first()
         if not user:
             raise ValueError(f"User with ID {current_user_id} not found.")
 
-        async def async_click():
-            async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
-                client.keyboard.press(name)
+        # Ensure keys is a list
+        if isinstance(keys, str):
+            keys = [keys]
+        elif not isinstance(keys, list):
+            keys = list(keys)
 
-        asyncio.run(async_click())
+        async def async_key():
+            await asyncio.sleep(0.1)
+            async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
+                # Press all keys together (for combinations like Ctrl+L)
+                client.keyboard.press(*keys)
+                await asyncio.sleep(0.1)
+
+        asyncio.run(async_key())
 
     @staticmethod
     def screenshot(current_user_id: int):
@@ -251,6 +284,8 @@ class CommandService:
             raise ValueError(f"User with ID {current_user_id} not found.")
 
         async def async_screenshot():
+            # Small delay to avoid conflicts with other VNC clients
+            await asyncio.sleep(0.1)
             async with asyncvnc.connect('127.0.0.1', user.vnc_port) as client:
                 pixels = await client.screenshot()
                 image = Image.fromarray(pixels)
@@ -262,12 +297,13 @@ class CommandService:
     @staticmethod
     def run_command_via_container(command, current_user_id: int):
         """
-        Simulate running a command via container service.
+        Simulate running a command via container service and return the output.
         """
         command_to_execute = f"python3 /root/Desktop/orchestrator/app.py run '{command}'"
         container_service = ContainerService()
         output = container_service.exec_command_in_container(current_user_id, command_to_execute)
         print(output)
+        return output
 
     @staticmethod
     def run_background_command_via_container(command, current_user_id: int):

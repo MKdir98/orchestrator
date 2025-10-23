@@ -5,3 +5,5 @@
 /poetry.lock
 __pycache__/
 *.pyc
+orchestrator/services/data/
+.vscode

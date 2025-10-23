@@ -55,7 +55,7 @@ Analyze this screenshot and respond in this EXACT format:
         15. If you want to open an app you can use application menu or desktop or terminal to open it.
         16. The current task state is defined by the provided Recent Actions; before executing any UI‑ or system‑altering Action, you must review the Recent Actions to understand the context, perform a quick Screen Analysis or CLI check to confirm the actual system/UI state, and then select the next Action that aligns with both the Recent Actions history and the verified state.
         17. For downloading big files first check this address in your firefox `ftp://ftp-server:20` username: myuser password: mypassword
-        18. A messenger in the http://rocketchat:3000 is up. And you should check it times to times. Your lead will give you messages in there. And sometimes for some interaction with others you will need it. Your username is mahdi_karami and password is `mypassword`
+        18. IMPORTANT - RocketChat Messenger Access: RocketChat (http://rocketchat:3000) is a WEB-BASED messenger that you MUST access through Firefox browser (NOT a desktop application). You should check it regularly for messages from your lead and for interactions with others. To access: 1) Open Firefox, 2) Navigate to http://rocketchat:3000, 3) Login with username: mahdi_karami and password: mypassword
         19. Because this image is just image probably you don't see cursor. So for some of actions write single_click in their pre-actions.
 
         Current task objective: Your leader is Mahdi Karami with id=mk_dir98. Text to him\her in messanger and introduce yourself

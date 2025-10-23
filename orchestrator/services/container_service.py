@@ -1,6 +1,9 @@
 import docker
 import os
 import socket
+import asyncio
+import asyncvnc
+import time
 
 from orchestrator.services.websocket_service import websocket_manager
 
@@ -9,15 +12,59 @@ class ContainerService:
     def __init__(self):
         self.client = docker.from_env()
 
+    def check_vnc_connection(self, vnc_port, timeout=2):
+        """
+        Check if VNC server is accessible on the given port.
+        
+        Args:
+            vnc_port: The VNC port to check
+            timeout: Timeout in seconds
+            
+        Returns:
+            bool: True if VNC is accessible, False otherwise
+        """
+        try:
+            async def check_vnc():
+                try:
+                    async with asyncio.wait_for(
+                        asyncvnc.connect('127.0.0.1', vnc_port),
+                        timeout=timeout
+                    ) as client:
+                        return True
+                except Exception:
+                    return False
+            
+            return asyncio.run(check_vnc())
+        except Exception:
+            return False
+
     def find_container_by_user(self, user):
         try:
             # Get MODE from environment variables, default to 'dev' if not set
             mode = os.getenv('MODE', 'dev')
             container_name = f"orchestrator_container_{mode}_{user.id}"
-            
+
             container = self.client.containers.get(container_name)
+            
+            # If container is not running, start it
             if container.status != "running":
+                print(f"Container {container_name} is not running. Starting...")
                 container.start()
+                # Give it some time to start
+                time.sleep(2)
+            
+            # # Check if VNC is actually working
+            # if user.vnc_port:
+            #     if not self.check_vnc_connection(user.vnc_port):
+            #         print(f"VNC server not responding for user {user.id}. Restarting container...")
+            #         container.restart()
+            #         # Give it time to restart and start VNC
+            #         time.sleep(3)
+            #
+            #         # Check again
+            #         if not self.check_vnc_connection(user.vnc_port):
+            #             print(f"VNC still not responding after restart for user {user.id}")
+            
             return container
         except:
             return None
@@ -30,20 +77,20 @@ class ContainerService:
                 os.path.dirname(os.path.abspath(__file__)), "data", str(user.id)
             )
             os.makedirs(user_data_dir, exist_ok=True)
-            
+
             # Get MODE from environment variables, default to 'dev' if not set
             mode = os.getenv('MODE', 'dev')
             container_name = f"orchestrator_container_{mode}_{user.id}"
-            
+
             container = self.client.containers.run(
-                image="karam_orchestrator:latest",
-                command="sleep infinity",
+                image="xfce-orchestrator:latest",
                 detach=True,
                 network="orchestrator_default",
                 name=container_name,
+                restart_policy={"Name": "unless-stopped"},
                 ports={
                     "80/tcp": novnc_port,
-                    "5900/tcp": vnc_port
+                    "5901/tcp": vnc_port
                 },
                 volumes={
                     user_data_dir: {
@@ -80,7 +127,8 @@ class ContainerService:
         Returns:
             str: The output of the command, or an error message if the container is not found.
         """
-        container = self.client.containers.get(f"orchestrator_container_{user_id}")
+        mode = os.getenv('MODE')
+        container = self.client.containers.get(f"orchestrator_container_{mode}_{user_id}")
 
         exec_result = container.exec_run(command)
         print(exec_result)

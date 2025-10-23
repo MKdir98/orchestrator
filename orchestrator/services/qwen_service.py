@@ -1,4 +1,4 @@
-from gradio_client import Client, handle_file
+rom gradio_client import Client, handle_file
 
 import os
 

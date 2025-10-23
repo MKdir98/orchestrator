@@ -9,6 +9,7 @@ class WebSocketManager:
         self.active_connections = {}
         self.lock = threading.Lock()
         self.socketio = None
+        self.app = None  # Flask app instance for context
 
     def add_connection(self, user_id, sid):
         with self.lock:
@@ -20,21 +21,22 @@ class WebSocketManager:
                 del self.active_connections[user_id]
 
     def send_to_user_with_format(self, system_user_id, event_type: WebSocketType, data: str):
-        # def send():
         connection = self.active_connections.get(system_user_id)
-        if connection:
-            try:
-                data_json = json.dumps({'event_type': event_type.value, 'data': data})
-                self.socketio.send(data_json, to=connection)
-                print('Sending ' + data_json + ' to ' + str(system_user_id))
-            except Exception as e:
-                print(f"Error sending message to user {system_user_id}: {e}")
-
-        # if self.socketio:
-        #     import threading
-        #     threading.Thread(target=send, daemon=True).start()
-        # else:
-        #     print("SocketIO is not set!")
+        
+        if not connection or not self.socketio:
+            return
+        
+        try:
+            data_json = json.dumps({'event_type': event_type.value, 'data': data})
+            
+            # Use server.emit directly (bypasses Flask context issues)
+            if hasattr(self.socketio, 'server'):
+                self.socketio.server.emit('message', data_json, room=connection, namespace='/')
+            else:
+                self.socketio.emit('message', data_json, to=connection, namespace='/')
+                    
+        except Exception as e:
+            print(f"Error sending message to user {system_user_id}: {e}")
 
     def broadcast(self, message):
         with self.lock:

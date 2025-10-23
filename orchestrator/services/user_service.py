@@ -43,8 +43,6 @@ def check_and_create_containers():
                 print(f"Container created successfully for user '{user.name}'.")
             else:
                 print(f"Failed to create container for user '{user.name}'.")
-        else:
-            print(f"Container for user '{user.name}' already exists.")
 
 
 def get_users_by_group(db: Session, group_id: int):

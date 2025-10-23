@@ -6,6 +6,6 @@
         "image_width": "1024",
         "image_height": "208",
         "description": "Click on the Firefox icon to open the browser",
-        "memory_data": "The leader's ID is mk_dir98. The messenger is at http://rocketchat:3000. Login credentials are username: mahdi_karami and password: mypassword."
+        "memory_data": "The leader's ID is mk_dir98. The messenger RocketChat is a WEB-BASED application (accessible via browser only, NOT a desktop app) at http://rocketchat:3000. Login credentials are username: mahdi_karami and password: mypassword."
     }
 }]

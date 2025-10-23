@@ -12,9 +12,9 @@ Screen Analysis:
 - [width and height size of the picture]: [1024, 208]
 
 Task Status: not complete
-Reason: Need to open Firefox, navigate to the Rocket Chat messenger at http://rocketchat:3000, login with credentials (mahdi_karami/mypassword), and send a message to Mahdi Karami (mk_dir98).
+Reason: Need to open Firefox browser, navigate to the RocketChat web-based messenger at http://rocketchat:3000 (RocketChat is a web application, NOT a desktop app, so Firefox is required), login with credentials (mahdi_karami/mypassword), and send a message to Mahdi Karami (mk_dir98).
 
-Something should store in memory: The leader's ID is mk_dir98. The messenger is at http://rocketchat:3000. Login credentials are username: mahdi_karami and password: mypassword.
+Something should store in memory: The leader's ID is mk_dir98. The messenger RocketChat is a WEB-BASED application accessible via browser at http://rocketchat:3000. Login credentials are username: mahdi_karami and password: mypassword.
 
 Next Actions (list ALL required actions in order):
 
@@ -22,10 +22,10 @@ Next Actions (list ALL required actions in order):
 - Type: double_click
 - Target: Firefox icon
 - Detail: N/A
-- Reason: Need to open Firefox browser to access the messenger website
+- Reason: Need to open Firefox browser to access RocketChat (RocketChat is a WEB-BASED messenger that requires a browser, NOT a desktop application)
 - Pre-Actions: single_click on desktop to ensure focus
 - Post-Actions: Wait for Firefox to load completely
-- Thought: Firefox needs to be opened first to access the web-based messenger
+- Thought: Firefox needs to be opened first to access the web-based RocketChat messenger
 
 2. Action:
 - Type: wait

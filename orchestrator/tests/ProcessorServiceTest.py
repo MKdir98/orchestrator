@@ -513,8 +513,8 @@ Timestamp: 2025-04-16 10:41:44.933286
     def t1est_rag(self):
         rag1 = RAGSystem()
         rag = RAGSystem()
-        rag1.add_text('The test is important')
-        result = rag.query_context('give all the things that you know?')
+        rag1.add_text(1, 'The test is important')
+        result = rag.query_context(1, 'give all the things that you know?')
         print(result)
 
     def test_lm_arena(self):
@@ -1129,6 +1129,5 @@ Analyze the screenshot with extreme precision and attention to detail. Focus on 
         # print(instance.capture_the_flag(
         #     "At UOD (University of Divar), your professor has assigned you a task, You are given a small codebase located in `{https://divar-contest.darkube.app/public-code-bug-fix.zip}` and a logs.txt file. Analyze the logs, identify and fix the bug in the codebase, then run the program (main.py) and return its output as the flag."))
         # print(instance.capture_the_flag("find wikipedia link in html content in this url: https://divar-contest.darkube.app/divar_sample.html and based on information on that link return how many users open app annually according to the new annual report of Divar, do not round the number, return only the number without any dots or commas"))
-
     if __name__ == '__main__':
         unittest.main()

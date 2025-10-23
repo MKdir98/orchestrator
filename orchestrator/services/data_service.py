@@ -14,6 +14,9 @@ class DataService:
     def get_user_path_screenshot_with_local_coordinates(self, user_id: int, step_id: int):
         return self.get_user_data_path(user_id) + 'screenshot_local_coordinates.png'
 
+    def get_user_path_screenshot_with_coordinates_scaled(self, user_id: int, step_id: int):
+        return self.get_user_data_path(user_id) + 'screenshot_scaled_coordinates.png'
+
     def get_user_data_path(self, user_id: int):
         path = self.get_orchestrator_path() + str(user_id) + '/'
         os.makedirs(path, exist_ok=True)
@@ -24,7 +27,6 @@ class DataService:
         base_path = os.path.dirname(os.path.dirname(os.path.dirname(current_file)))
         path = base_path + '/orchestrator_data/' + os.getenv('MODE') + '/'
         os.makedirs(path, exist_ok=True)
-        print(path)
         return path
 
     def get_log_path(self, log_id: int):
@@ -42,9 +44,9 @@ class DataService:
         return path
 
     def get_user_checkpoint_path(self, user_id: int, step_id: int):
-        """
-        مسیر فایل checkpoint برای یک کاربر و مرحله خاص
-        """
         checkpoints_dir = os.path.join(self.get_user_data_path(user_id), 'checkpoints')
         os.makedirs(checkpoints_dir, exist_ok=True)
         return os.path.join(checkpoints_dir, f'checkpoint_{step_id}.json')
+    
+    def get_user_path_screenshot_with_full_visualization(self, user_id: int, step_id: int):
+        return self.get_user_data_path(user_id) + f'screenshot_full_visualization_{step_id}.png'

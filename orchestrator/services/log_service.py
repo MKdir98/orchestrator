@@ -179,7 +179,7 @@ class DBLogService(BaseLogService):
                 return None
             return [log.to_dict() for log in logs]
 
-    def get_logs_by_task_step(self, task_id, current_user, include_images=True):
+    def get_logs_by_task_step(self, task_id, current_user, include_images=True, page=1, per_page=50, log_types=None):
 
         with get_db() as db:
             task = db.query(Task).filter(Task.id == task_id).first()
@@ -187,9 +187,32 @@ class DBLogService(BaseLogService):
                 raise ResourceNotFoundException(Task, task_id)
             if task.user.group.system_user_id != current_user.id:
                 raise AccessDeniedException()
-            logs = db.query(Log).filter(Log.task_id == task_id).order_by(Log.timestamp).all()
-            if not logs:
-                return {}
+            
+            # شروع کوئری با فیلتر task_id
+            query = db.query(Log).filter(Log.task_id == task_id)
+            
+            # فیلتر بر اساس نوع لاگ‌ها
+            if log_types and len(log_types) > 0:
+                query = query.filter(Log.type.in_(log_types))
+            
+            # ترتیب نزولی (جدیدترین بالا) و pagination
+            query = query.order_by(Log.timestamp.desc())
+            
+            # محاسبه total count قبل از pagination
+            total_count = query.count()
+            
+            # اعمال pagination
+            offset = (page - 1) * per_page
+            logs = query.offset(offset).limit(per_page).all()
+            
+            if not logs and page == 1:
+                return {
+                    "step_logs": {},
+                    "total_count": 0,
+                    "page": page,
+                    "per_page": per_page,
+                    "total_pages": 0
+                }
 
             step_logs = {}
 
@@ -214,7 +237,16 @@ class DBLogService(BaseLogService):
 
                 step_logs[step_name].append(log_dict)
 
-            return step_logs
+            # محاسبه تعداد صفحات
+            total_pages = (total_count + per_page - 1) // per_page
+            
+            return {
+                "step_logs": step_logs,
+                "total_count": total_count,
+                "page": page,
+                "per_page": per_page,
+                "total_pages": total_pages
+            }
 
 
 logService = DBLogService()

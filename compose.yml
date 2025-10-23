@@ -32,7 +32,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-
   mongodb:
     image: docker.io/bitnami/mongodb:${MONGODB_VERSION:-6.0}
     restart: always
@@ -40,6 +39,9 @@ services:
       - mongodb_data:/bitnami/mongodb
     environment:
       MONGODB_REPLICA_SET_MODE: primary
+      ADMIN_USERNAME: 'admin'
+      ADMIN_EMAIL: 'mahdikarami1000@gmail.com'
+      ADMIN_PASSWORD: '123456Aa'
       MONGODB_REPLICA_SET_NAME: rs0
       MONGODB_PORT_NUMBER: 27017
       MONGODB_INITIAL_PRIMARY_HOST: mongodb
@@ -52,6 +54,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    ports:
+      - "27017:27017"
 
   ftp-server:
     image: fauria/vsftpd
