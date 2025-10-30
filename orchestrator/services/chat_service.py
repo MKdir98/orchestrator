@@ -1,8 +1,9 @@
 import json, requests, os
+from datetime import datetime
 from sqlalchemy.testing.suite.test_reflection import users
 
 from orchestrator.models.base import SessionLocal
-from orchestrator.models import User
+from orchestrator.models import User, Message
 from orchestrator.services.processor_service import ProcessorService
 from orchestrator.services.task_service import TaskService
 
@@ -110,3 +111,172 @@ class ChatService:
         response = requests.request("POST", url, headers=headers, data=payload)
 
         print(response.text)
+
+    def get_direct_messages(self, username: str, since_timestamp=None):
+        """
+        دریافت پیغام‌های direct message برای یک user از RocketChat
+        
+        Args:
+            username: نام کاربری agent در RocketChat
+            since_timestamp: تاریخ آخرین پیغام (برای دریافت فقط پیغام‌های جدید)
+        
+        Returns:
+            لیست پیغام‌های جدید
+        """
+        try:
+            # ابتدا باید room ID رو پیدا کنیم (direct message room بین admin و این user)
+            # فرض: admin پیغام میده، پس باید direct message room بین admin و username رو پیدا کنیم
+            
+            # دریافت لیست direct messages
+            url = os.getenv('ROCKET_CHAT_ADDRESS') + "/api/v1/im.list"
+            headers = {
+                'X-Auth-Token': os.getenv("ROCKET_CHAT_AUTH_TOKEN"),
+                'X-User-Id': os.getenv("ROCKET_CHAT_USER_ID"),
+                'Content-Type': 'application/json'
+            }
+            
+            response = requests.get(url, headers=headers)
+            if response.status_code != 200:
+                print(f"Error fetching IM list for {username}: {response.text}")
+                return []
+            
+            ims = response.json().get('ims', [])
+            
+            # پیدا کردن room که شامل username است
+            target_room = None
+            for im in ims:
+                # چک کردن usernames در room
+                if 'usernames' in im and username in im['usernames']:
+                    target_room = im
+                    break
+            
+            if not target_room:
+                # هنوز room ایجاد نشده (پیغامی رد و بدل نشده)
+                return []
+            
+            room_id = target_room.get('_id')
+            
+            # دریافت پیغام‌های این room
+            messages_url = os.getenv('ROCKET_CHAT_ADDRESS') + f"/api/v1/im.messages?roomId={room_id}"
+            
+            # اگر since_timestamp داده شده، فقط پیغام‌های بعد از آن تاریخ
+            if since_timestamp:
+                # تبدیل به ISO format
+                if isinstance(since_timestamp, datetime):
+                    since_iso = since_timestamp.isoformat()
+                else:
+                    since_iso = since_timestamp
+                messages_url += f"&oldest={since_iso}"
+            
+            messages_response = requests.get(messages_url, headers=headers)
+            if messages_response.status_code != 200:
+                print(f"Error fetching messages for room {room_id}: {messages_response.text}")
+                return []
+            
+            messages = messages_response.json().get('messages', [])
+            
+            # فیلتر کردن: فقط پیغام‌هایی که از admin اومده (نه از خود agent)
+            admin_username = os.getenv('ROCKET_CHAT_ADMIN_NAME', 'admin').replace(' ', '_').lower()
+            filtered_messages = []
+            for msg in messages:
+                msg_username = msg.get('u', {}).get('username', '')
+                # فقط پیغام‌های admin
+                if msg_username == admin_username:
+                    filtered_messages.append(msg)
+            
+            return filtered_messages
+            
+        except Exception as e:
+            print(f"Exception in get_direct_messages for {username}: {str(e)}")
+            return []
+
+    def get_last_message_time(self, db, user_id):
+        """
+        دریافت زمان آخرین پیغام ذخیره شده برای یک user
+        
+        Args:
+            db: Database session
+            user_id: ID کاربر
+        
+        Returns:
+            datetime آخرین پیغام یا None
+        """
+        try:
+            last_message = db.query(Message).filter(
+                Message.user_id == user_id
+            ).order_by(Message.rocketchat_timestamp.desc()).first()
+            
+            if last_message and last_message.rocketchat_timestamp:
+                return last_message.rocketchat_timestamp
+            
+            return None
+        except Exception as e:
+            print(f"Error getting last message time for user {user_id}: {str(e)}")
+            return None
+
+    def save_new_messages_to_db(self):
+        """
+        برای تمام user های فعال، پیغام‌های جدید رو بگیر و در DB ذخیره کن
+        این متد توسط scheduler هر 2 دقیقه یکبار فراخوانی میشه
+        """
+        db = SessionLocal()
+        try:
+            users = db.query(User).all()
+            total_new_messages = 0
+            
+            for user in users:
+                try:
+                    username = user.name.replace(' ', '_').lower()
+                    last_message_time = self.get_last_message_time(db, user.id)
+                    
+                    new_messages = self.get_direct_messages(username, since_timestamp=last_message_time)
+                    
+                    for msg in new_messages:
+                        # چک کنیم که این پیغام قبلاً ذخیره نشده باشه
+                        msg_id = msg.get('_id')
+                        existing = db.query(Message).filter(
+                            Message.rocketchat_message_id == msg_id
+                        ).first()
+                        
+                        if existing:
+                            continue  # این پیغام قبلاً ذخیره شده
+                        
+                        # ساخت Message جدید
+                        msg_timestamp = msg.get('ts')
+                        if isinstance(msg_timestamp, dict) and '$date' in msg_timestamp:
+                            # فرمت RocketChat: {"$date": 1234567890123}
+                            timestamp_ms = msg_timestamp['$date']
+                            msg_datetime = datetime.fromtimestamp(timestamp_ms / 1000.0)
+                        elif isinstance(msg_timestamp, str):
+                            # فرمت ISO
+                            msg_datetime = datetime.fromisoformat(msg_timestamp.replace('Z', '+00:00'))
+                        else:
+                            msg_datetime = datetime.utcnow()
+                        
+                        new_message = Message(
+                            rocketchat_message_id=msg_id,
+                            user_id=user.id,
+                            sender_username=msg.get('u', {}).get('username', 'unknown'),
+                            content=msg.get('msg', ''),
+                            is_read=False,
+                            is_processed=False,
+                            rocketchat_timestamp=msg_datetime
+                        )
+                        
+                        db.add(new_message)
+                        total_new_messages += 1
+                    
+                except Exception as e:
+                    print(f"Error processing messages for user {user.name} (id={user.id}): {str(e)}")
+                    continue
+            
+            db.commit()
+            
+            if total_new_messages > 0:
+                print(f"✓ Saved {total_new_messages} new messages to database")
+            
+        except Exception as e:
+            print(f"Error in save_new_messages_to_db: {str(e)}")
+            db.rollback()
+        finally:
+            db.close()

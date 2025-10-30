@@ -17,7 +17,7 @@ import traceback
 
 from sympy.codegen.ast import continue_
 
-from orchestrator.models import SystemUser
+from orchestrator.models import SystemUser, Message
 from orchestrator.models.WebSocketType import WebSocketType
 from orchestrator.models.base import SessionLocal
 from orchestrator.models.task import TaskStatus, Task, TaskMessage
@@ -119,6 +119,12 @@ tools = {
         "parameters": {
             "name": "Full name of the user",
             "employee_description": "Detail of the employee in full detail to create by these description"
+        }
+    },
+    "read_and_respond_messages": {
+        "description": "Read manager messages from RocketChat and respond appropriately",
+        "parameters": {
+            "description": "Reason",
         }
     }
 }
@@ -530,7 +536,17 @@ IF ANSWER TO Q3 IS YES:
         8. Check FTP (ftp://ftp-server:20) for files if needed
         9. Check RocketChat messenger (http://rocketchat:3000) - IMPORTANT: RocketChat is a web-based messenger, you MUST use Firefox browser to access it
         10. Username: {username}, Password: mypassword (for both)
-        11. KEYBOARD SHORTCUTS: Always use list format:
+        11. MANAGER MESSAGES & NOTIFICATIONS:
+            - If you see RocketChat notification badge or unread message indicator
+            - Navigate to RocketChat in Firefox browser
+            - Check for new messages from your manager
+            - Read messages carefully - some may be tasks, some may be just chat
+            - If task "Check and respond to manager messages" exists, you should:
+              1. Open Firefox and go to RocketChat (http://rocketchat:3000)
+              2. Click on the direct message with your manager
+              3. Read all unread messages
+              4. The messages will be automatically processed (task creation if needed)
+        12. KEYBOARD SHORTCUTS: Always use list format:
             - Ctrl+L (address bar): ["Control_L", "l"]
             - Ctrl+T (new tab): ["Control_L", "t"]
             - Ctrl+W (close tab): ["Control_L", "w"]
@@ -1803,6 +1819,10 @@ IF ANSWER TO Q3 IS YES:
 
             # در صورت تکمیل موفق، checkpoint را پاک کن
             self.clear_checkpoint()
+            
+            # چک کردن پیغام‌های جدید بعد از هر step
+            self.check_and_create_message_task()
+            
             return can_continue
         except Exception as e:
             self.websocket_manager.send_to_user_with_format(self.system_user.id, WebSocketType.ERROR_IN_PROCESS, {
@@ -1913,6 +1933,180 @@ IF ANSWER TO Q3 IS YES:
         self.websocket_manager.send_to_user_with_format(self.system_user.id, WebSocketType.USER_UPDATE,
                                                         new_task.summary())
         return f"Created task {new_task.id} (current task continues)"
+
+    def check_and_create_message_task(self):
+        """
+        چک کردن پیغام‌های خوانده نشده و ایجاد task در صورت لزوم
+        این متد بعد از هر step اجرا میشه
+        """
+        try:
+            unread_count = self.db.query(Message).filter(
+                Message.user_id == self.user_id,
+                Message.is_read == False
+            ).count()
+            
+            if unread_count > 0:
+                # چک کن آیا task مربوط به check messages وجود داره
+                existing_task = self.db.query(Task).filter(
+                    Task.user_id == self.user_id,
+                    Task.description.like("%Check and respond to manager messages%"),
+                    Task.status.in_([TaskStatus.NEW, TaskStatus.IN_PROGRESS])
+                ).first()
+                
+                if not existing_task:
+                    # Task جدید با priority بالا بساز
+                    message_task = Task(
+                        description=f"Check and respond to manager messages ({unread_count} unread)",
+                        user_id=self.user_id,
+                        priority=1000,  # Priority بالا
+                        status=TaskStatus.NEW
+                    )
+                    self.db.add(message_task)
+                    self.db.commit()
+                    
+                    print(f"✓ Created message task for user {self.user_id}: {unread_count} unread messages")
+                    
+                    # ارسال notification به WebSocket
+                    self.websocket_manager.send_to_user_with_format(
+                        self.system_user.id, 
+                        WebSocketType.USER_UPDATE,
+                        message_task.summary()
+                    )
+        except Exception as e:
+            print(f"Error in check_and_create_message_task: {str(e)}")
+            traceback.print_exc()
+
+    def read_and_respond_messages(self, description):
+        """
+        خواندن پیغام‌های مدیر و پاسخ دادن هوشمندانه
+        این متد توسط agent وقتی task "Check messages" رو میبینه، اجرا میشه
+        """
+        try:
+            # 1. دریافت پیغام‌های unread
+            unread_messages = self.db.query(Message).filter(
+                Message.user_id == self.user_id,
+                Message.is_read == False
+            ).order_by(Message.created_at).all()
+            
+            if not unread_messages:
+                return "No unread messages"
+            
+            print(f"Processing {len(unread_messages)} unread messages for user {self.user_id}")
+            
+            # 2. Agent باید RocketChat رو باز کنه و پیغام‌ها رو ببینه
+            # این قسمت باید توسط vision و action model انجام بشه
+            # برای الان فرض میکنیم که agent رفته و پیغام‌ها رو دیده
+            
+            # 3. تحلیل پیغام‌ها با AI و تصمیم‌گیری
+            tasks_created = []
+            for message in unread_messages:
+                try:
+                    response = self.analyze_manager_message(message)
+                    
+                    # اگر نیاز به task بود، ساخته میشه
+                    if response.get('needs_task'):
+                        from orchestrator.services.task_service import TaskService
+                        new_task = TaskService.create_task(
+                            self.db, 
+                            response['task_description'], 
+                            self.user_id
+                        )
+                        tasks_created.append(new_task.id)
+                        print(f"  ✓ Created task {new_task.id}: {response['task_description']}")
+                    
+                    # پیغام رو به عنوان read علامت بزن
+                    message.is_read = True
+                    message.is_processed = True
+                    
+                except Exception as e:
+                    print(f"Error processing message {message.id}: {str(e)}")
+                    continue
+            
+            self.db.commit()
+            
+            result_msg = f"Processed {len(unread_messages)} messages"
+            if tasks_created:
+                result_msg += f", created {len(tasks_created)} new tasks"
+            
+            print(f"✓ {result_msg}")
+            return result_msg
+            
+        except Exception as e:
+            print(f"Error in read_and_respond_messages: {str(e)}")
+            traceback.print_exc()
+            return f"Error processing messages: {str(e)}"
+
+    def analyze_manager_message(self, message: Message):
+        """
+        تحلیل پیغام مدیر با AI برای تشخیص نیاز به task یا پاسخ ساده
+        
+        Args:
+            message: Message object
+        
+        Returns:
+            dict با کلیدهای needs_task, task_description, response_message
+        """
+        try:
+            prompt = f'''Analyze this manager message and determine if it requires action:
+
+Manager: "{message.content}"
+
+Determine:
+1. Is this a task/request that needs action? (yes/no)
+2. If yes, what should the task description be?
+3. What is the appropriate response message?
+
+Examples:
+- "Can you check the sales report?" → needs_task: true, task: "Review and analyze sales report"
+- "Good job on yesterday's work!" → needs_task: false, response: "Thank you!"
+- "Please install Python on your machine" → needs_task: true, task: "Install Python programming language"
+
+Respond in valid JSON format:
+{{
+    "needs_task": true/false,
+    "task_description": "detailed task description if needs_task is true, otherwise empty",
+    "response_message": "appropriate response to manager"
+}}
+'''
+            
+            # استفاده از action_model برای تحلیل
+            # فرض: action_model.call میتونه بدون screenshot هم کار کنه برای text analysis
+            response = action_model.call(prompt, screenshot_path=None, tools={})
+            
+            # پارس کردن JSON response
+            if isinstance(response, tuple):
+                response = response[0]
+            
+            # تلاش برای parse JSON
+            try:
+                result = json.loads(response)
+            except json.JSONDecodeError:
+                # اگر JSON نبود، سعی کن از text استخراج کنی
+                import re
+                
+                needs_task = 'true' in response.lower() and 'needs_task' in response.lower()
+                
+                # سعی در استخراج task_description
+                task_match = re.search(r'"task_description":\s*"([^"]+)"', response)
+                task_desc = task_match.group(1) if task_match else message.content
+                
+                result = {
+                    "needs_task": needs_task,
+                    "task_description": task_desc if needs_task else "",
+                    "response_message": "Message received and processed"
+                }
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error analyzing message: {str(e)}")
+            traceback.print_exc()
+            # Fallback: فرض کن همه پیغام‌ها task هستند
+            return {
+                "needs_task": True,
+                "task_description": message.content,
+                "response_message": "I'll work on this"
+            }
 
     def _get_last_predictions(self):
         """خواندن ۳ پیش‌بینی آخر از task_messages"""

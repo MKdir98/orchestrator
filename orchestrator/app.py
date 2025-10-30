@@ -372,6 +372,7 @@ def create_app():
     chatService = ChatService()
     scheduler.add_job(func=check_and_create_containers, trigger="interval", minutes=1)
     scheduler.add_job(func=chatService.check_and_create_users_in_chat, trigger="interval", minutes=1)
+    scheduler.add_job(func=chatService.save_new_messages_to_db, trigger="interval", minutes=2)
     scheduler.start()
     websocket_manager.socketio = socketio
     websocket_manager.app = app
